@@ -421,7 +421,7 @@ def main() -> None:
 
     # ---- Phase-1 preprocessing
     print("\n[Phase 1] Analytical preprocessing...")
-    cj, sep, R0, loader, ic_builder = build_physics(cfg)
+    cj, sep, R0, _loader, ic_builder = build_physics(cfg)
 
     # ---- IC data
     samp = cfg["sampling"]
@@ -464,17 +464,6 @@ def main() -> None:
         rar_pool_factor=samp["rar"]["pool_factor"],
         device=str(device),
     )
-
-    # P_prod_fn from loader for early Stage-2 warmup
-    ch = loader.contact_pressure_history()
-    from scipy.interpolate import interp1d
-    _P_interp = interp1d(
-        ch["t"], ch["P_c"], kind="linear", bounds_error=False,
-        fill_value=(ch["P_c"][0], ch["P_c"][-1]),
-    )
-    def _P_prod_lsdyna(R_c):
-        t_np = contact_net._compute_t_from_Rc_approx(R_c)
-        return torch.tensor(_P_interp(t_np).reshape(-1, 1), dtype=torch.float32, device=device)
 
     bcsub = cfg["loss_weights"]["bc_sub_weights"]
     bc_loss = BCLoss(
