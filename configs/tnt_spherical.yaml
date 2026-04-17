@@ -1,0 +1,150 @@
+# PINN Spherical TNT Blast Wave — Master Configuration
+# Units: SI (kg, m, s, Pa, J)
+
+# ---------------- Explosive: TNT (Lee-Tarver 1980 standard JWL parameters) ----------------
+explosive:
+  name: TNT
+  rho0: 1630.0            # kg/m^3, undetonated density
+  D_CJ: 6930.0            # m/s,   Chapman-Jouguet detonation speed
+  W: 1.0                  # kg,    charge mass (spherical)
+  jwl:
+    A:  3.7121e+11        # Pa  (371.21 GPa)
+    B:  3.2306e+9         # Pa  (3.2306 GPa)
+    R1: 4.15
+    R2: 0.95
+    omega: 0.30
+    E0: 7.0e+9            # J/m^3 (7.0 GJ/m^3, detonation energy per unit initial volume)
+
+# ---------------- Ambient air (calorically perfect ideal gas) ----------------
+air:
+  gamma: 1.4
+  rho_a: 1.225            # kg/m^3
+  P_a:   101325.0         # Pa
+  # Derived speed of sound c_a = sqrt(gamma * P_a / rho_a) ~= 340 m/s
+
+# ---------------- Analytical preprocessing (Phase 1: CJ -> contact -> t_sep) ----------------
+preprocessing:
+  v_cj_bracket: [0.5, 0.95]     # search bracket for v_CJ = V_CJ / V0
+  isentrope_v_max: 15.0         # upper end of u_p(V) lookup table
+  isentrope_n_points: 800       # log-spaced grid size
+  secant_P_init_frac: 0.5       # P_c^(0) = this * P_CJ for contact-matching secant
+  secant_tol: 1.0e-3            # relative tolerance for u_p == u_s root
+  secant_max_iter: 100
+  quasisteady_dt: 1.0e-7        # s, explicit time step for R_c/R_s evolution
+  quasisteady_t_max: 5.0e-3     # s, hard ceiling (separation will occur earlier)
+  separation:
+    P_threshold_ratio: 20.0     # separation when P_c < this * P_a
+    v_threshold: 7.0            # or when v_c = (R_c/R0)^3 exceeds this
+
+# ---------------- PINN domain ----------------
+domain:
+  t_end: 15.0e-3          # s, PINN training horizon (post t_sep)
+  R_far_factor: 1.5       # R_far = this * R_s^sep
+  rho_ref: 1.225          # normalization references
+  P_ref:   101325.0
+  u_ref:   340.0
+
+# ---------------- Network architecture ----------------
+networks:
+  main:
+    type: siren
+    depth: 6
+    width: 128
+    omega0: 30.0
+  contact:
+    type: mlp
+    depth: 4
+    width: 64
+    activation: tanh
+  shock:
+    type: mlp
+    depth: 4
+    width: 64
+    activation: tanh
+
+# ---------------- Collocation / sampling ----------------
+sampling:
+  N_IC: 500               # t = t_sep profile points
+  N_f:  20000             # interior Euler residuals
+  N_c:  500               # contact-surface BC points
+  N_inf: 200              # farfield C+ characteristic points
+  N_s:  500               # shock-surface RH points
+  rar:
+    enabled: true
+    interval: 500         # steps between resamples
+    fraction: 0.20        # refresh this fraction with high-residual points
+    pool_factor: 10       # candidate pool is pool_factor * resample count
+
+# ---------------- Artificial viscosity (AV) ----------------
+artificial_viscosity:
+  length_scale_factor: 1.0   # ell = this * dr_characteristic
+  c1_start: 2.0              # linear (shock) coefficient
+  c1_end:   0.1
+  c2_start: 0.5              # bulk (sound) coefficient
+  c2_end:   0.05
+
+# ---------------- Loss weights ----------------
+loss_weights:
+  stage1:
+    IC:  100.0
+    PDE:   0.0
+    BC:    0.0
+    RH:    0.0
+  stage2:
+    IC:  100.0
+    PDE:   1.0
+    BC:   10.0
+    RH:   20.0
+  stage3:
+    IC:   10.0
+    PDE:   1.0
+    BC:   10.0
+    RH:  100.0
+  bc_sub_weights:
+    contact_pressure: 10.0   # beta_a
+    contact_velocity: 1.0    # beta_b
+    farfield_C_plus:  1.0    # beta_c
+  dynamic_balancing:
+    enabled: true
+    method: gradnorm         # or 'ntk'
+    interval: 1000
+
+# ---------------- PDE residual shock sensor ----------------
+pde_sensor:
+  alpha: 1.0e-4              # sigma = 1 / (1 + alpha * (dP/P)^2)
+
+# ---------------- Training schedule ----------------
+training:
+  device: auto                # 'cuda' | 'cpu' | 'auto'
+  seed: 20260416
+  stage1:
+    steps: 5000
+    optimizer: adam
+    lr: 1.0e-3
+    freeze_shocknet: true
+    freeze_contactnet: true
+  stage2:
+    steps: 50000
+    optimizer: adam
+    lr: 1.0e-4
+    lr_schedule: cosine
+    freeze_shocknet_steps: 5000    # prior-only ShockNet for this many steps
+    pprod_from_lsdyna_steps: 5000  # use LSDYNALoader for P_prod(t) in this warmup window
+    av_anneal: linear
+    batch_chunks: 4                # split N_f across this many chunks
+  stage3:
+    steps: 8000
+    optimizer: lbfgs
+    lr: 1.0
+    max_iter_per_step: 20
+    history_size: 50
+  checkpoint_dir: checkpoints
+  log_interval: 100
+
+# ---------------- Validation thresholds ----------------
+validation:
+  Rs_error_tol: 0.01          # 1% relative error vs reference R_s(t)
+  Rc_error_tol: 0.02
+  Pshock_error_tol: 0.05
+  cj_pressure_reference: 21.0e+9  # ~21 GPa tabulated for TNT, for sanity check
+  cj_pressure_tol: 0.10           # 10% tolerance
