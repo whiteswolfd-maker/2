@@ -113,14 +113,13 @@ class PDELoss(nn.Module):
         pool_n    = n_replace * self.rar_pool_factor
         pool      = self._sample_points(pool_n)
 
-        # Evaluate residuals on pool (no_grad)
-        with torch.no_grad():
-            rp = pool[:, 0:1].requires_grad_(True)
-            tp = pool[:, 1:2].requires_grad_(True)
-            rho_p, u_p, P_p = self.main_net(rp, tp)
-            rm, rmom, ren = euler_residuals(rho_p, u_p, P_p, rp, tp,
-                                            gamma=self.gamma, mu_av=0.0)
-            pool_res = (rm ** 2 + rmom ** 2 + ren ** 2).detach()
+        # Evaluate residuals on pool (need grad for autograd inside euler_residuals)
+        rp = pool[:, 0:1].requires_grad_(True)
+        tp = pool[:, 1:2].requires_grad_(True)
+        rho_p, u_p, P_p = self.main_net(rp, tp)
+        rm, rmom, ren = euler_residuals(rho_p, u_p, P_p, rp, tp,
+                                        gamma=self.gamma, mu_av=0.0)
+        pool_res = (rm ** 2 + rmom ** 2 + ren ** 2).detach()
 
         # Pick top n_replace
         _, top_idx = torch.topk(pool_res.squeeze(), n_replace)
