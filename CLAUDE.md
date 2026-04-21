@@ -28,7 +28,7 @@ python -m pinn.trainer --stage 2 --config configs/tnt_spherical.yaml
 python -m pinn.trainer --stage 3 --config configs/tnt_spherical.yaml
 ```
 
-**必須從項目根目錄運行**（即 `pinn_tnt_explosion.py` 所在的目錄）：
+**必須從項目根目錄運行**（即包含 `pinn/` 目錄的項目根目錄）：
 ```bash
 cd /path/to/project
 python -m pinn.trainer ...

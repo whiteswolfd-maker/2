@@ -261,7 +261,6 @@ def run_stage2(
     bc_loss: BCLoss,
     rh_loss: RHLoss,
     device,
-    shock_prior_fn=None,
 ) -> None:
     scfg  = cfg["training"]["stage2"]
     steps = scfg["steps"]
@@ -312,26 +311,27 @@ def run_stage2(
         L_rh  = rh_loss()
 
         w = weights
-        total = w["IC"] * L_ic + w["PDE"] * L_pde + w["BC"] * L_bc + w["RH"] * L_rh
-        total.backward()
 
-        # GradNorm balancing
+        # GradNorm balancing: per-loss gradient norms via torch.autograd.grad
         if balancer is not None and step % balancer_interval == 0:
             loss_vals = {
                 "IC": L_ic.item(), "PDE": L_pde.item(),
                 "BC": L_bc.item(), "RH": L_rh.item(),
             }
-            # Approximate gradient norms via main_net first-layer grads
             grad_norms = {}
-            for k, L in [("IC", L_ic), ("PDE", L_pde), ("BC", L_bc), ("RH", L_rh)]:
-                gn = sum(
-                    p.grad.norm().item() ** 2
-                    for p in main_net.parameters()
-                    if p.grad is not None
-                ) ** 0.5
+            shared_params = [p for p in main_net.parameters() if p.requires_grad]
+            for k, L_k in [("IC", L_ic), ("PDE", L_pde), ("BC", L_bc), ("RH", L_rh)]:
+                grads = torch.autograd.grad(
+                    L_k, shared_params, retain_graph=True, allow_unused=True,
+                )
+                gn = sum(g.norm().item() ** 2 for g in grads if g is not None) ** 0.5
                 grad_norms[k] = gn + 1e-10
             balancer.update(loss_vals, grad_norms)
             weights.update(balancer.weights)
+            w = weights
+
+        total = w["IC"] * L_ic + w["PDE"] * L_pde + w["BC"] * L_bc + w["RH"] * L_rh
+        total.backward()
 
         optimizer.step()
         scheduler.step()
@@ -453,6 +453,7 @@ def main() -> None:
         t_sep=sep.t_sep,
         t_end=cfg["domain"]["t_end"],
         R_c_fn=lambda t: contact_net(t),
+        R_c_min=sep.R_c,
         R_far=R_far,
         N_f=samp["N_f"],
         alpha_sensor=cfg["pde_sensor"]["alpha"],

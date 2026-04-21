@@ -113,7 +113,7 @@ class BCLoss(nn.Module):
     def _loss_a(self, t_c: torch.Tensor) -> torch.Tensor:
         """Contact-face pressure continuity."""
         R_c = self.contact_net(t_c)
-        P_net_rc, _, _ = self.main_net(R_c, t_c)
+        _, _, P_net_rc = self.main_net(R_c, t_c)
         P_prod = self._P_prod(R_c)
         return ((P_net_rc - P_prod) ** 2).mean()
 

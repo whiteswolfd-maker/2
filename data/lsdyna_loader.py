@@ -156,7 +156,6 @@ class AnalyticalLoader:
 
         # Sedov self-similar profile
         r = np.linspace(R_c, R_s, self._n_r)
-        xi = (r - R_c) / (R_s - R_c + 1e-30)  # map to [0, 1]
         xi_sedov = r / R_s
         f_rho, f_u, f_P = _sedov_profile(xi_sedov, gamma=g)
 

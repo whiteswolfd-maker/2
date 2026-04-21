@@ -14,6 +14,8 @@ Each residual is normalised by a characteristic pressure scale so that all
 three contribute comparably.
 """
 
+import math
+
 from __future__ import annotations
 
 import torch
@@ -97,7 +99,7 @@ class RHLoss(nn.Module):
 
         # Normalise to make residuals dimensionless
         # r1: [kg/(m²·s)]  scale ~ rho_a * D_s ~ rho_a * sqrt(γ P_a / rho_a) ~ sqrt(rho_a * P_a)
-        rho_D_scale = self.rho_scale * torch.sqrt(torch.tensor(g * P_a / rho_a))
+        rho_D_scale = self.rho_scale * math.sqrt(g * P_a / rho_a)
         # r2: [Pa]
         # r3: [J/kg] = [m²/s²]
         r1_n = r1 / (rho_D_scale + 1e-10)

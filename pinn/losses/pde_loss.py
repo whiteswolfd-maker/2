@@ -60,6 +60,7 @@ class PDELoss(nn.Module):
         t_sep: float = 0.0,
         t_end: float = 15e-3,
         R_c_fn=None,
+        R_c_min: float = 0.0,
         R_far: float = 1.0,
         N_f: int = 20_000,
         alpha_sensor: float = 1e-4,
@@ -79,6 +80,7 @@ class PDELoss(nn.Module):
         self.t_sep          = t_sep
         self.t_end          = t_end
         self.R_c_fn         = R_c_fn
+        self.R_c_min        = R_c_min
         self.R_far          = R_far
         self.N_f            = N_f
         self.alpha_sensor   = alpha_sensor
@@ -101,7 +103,7 @@ class PDELoss(nn.Module):
 
     def _sample_points(self, n: int) -> torch.Tensor:
         """Sample (r, t) uniformly in [R_c_min, R_far] × [t_sep, t_end]."""
-        r = torch.empty(n, 1, device=self.device).uniform_(0.0, self.R_far)
+        r = torch.empty(n, 1, device=self.device).uniform_(self.R_c_min, self.R_far)
         t = torch.empty(n, 1, device=self.device).uniform_(self.t_sep, self.t_end)
         return torch.cat([r, t], dim=1)   # (N, 2)
 
