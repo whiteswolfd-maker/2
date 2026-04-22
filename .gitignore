@@ -7,3 +7,15 @@ checkpoints/
 *.pt
 *.pkl
 
+# LS-DYNA generated files
+tnt_blast.k
+d3plot*
+d3thdt*
+d3dump*
+glstat
+messag
+nodout
+bndout
+binout*
+status.out
+
