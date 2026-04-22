@@ -14,9 +14,9 @@ Each residual is normalised by a characteristic pressure scale so that all
 three contribute comparably.
 """
 
-import math
-
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
