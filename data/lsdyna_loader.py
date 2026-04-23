@@ -16,6 +16,8 @@ raise ``NotImplementedError`` until implemented.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -208,33 +210,55 @@ class AnalyticalLoader:
 class FileLoader:
     """Load LS-DYNA outputs from CSV files in a results directory.
 
-    CSV format (one file per quantity, header row + numeric rows):
-        snapshot.csv   columns: r, rho, u, P
-        contact.csv    columns: t, P_c, u_c, R_c
-        shock.csv      columns: t, R_s, D_s
+    Expected files (produced by ``data.extract_lsdyna_output``):
+        snapshot.csv   columns: r, rho, u, P       (SI units)
+        contact.csv    columns: t, P_c, u_c, R_c   (SI units)
+        shock.csv      columns: t, R_s, D_s         (SI units)
         metadata.json  keys:    t_sep, R_c_sep, R_s_sep
-
-    Raises
-    ------
-    NotImplementedError
-        Until the user supplies data files and this method is implemented.
     """
 
     def __init__(self, data_dir: str) -> None:
-        self._data_dir = data_dir
+        self._dir = Path(data_dir)
+        self._meta = self._load_json("metadata.json")
+
+    def _load_json(self, name: str) -> dict:
+        p = self._dir / name
+        if not p.exists():
+            raise FileNotFoundError(f"FileLoader: missing {p}")
+        with open(p) as f:
+            return json.load(f)
+
+    def _load_csv(self, name: str) -> np.ndarray:
+        p = self._dir / name
+        if not p.exists():
+            raise FileNotFoundError(f"FileLoader: missing {p}")
+        return np.loadtxt(p, delimiter=",", skiprows=1)
 
     def separation_snapshot(self) -> dict:
-        raise NotImplementedError(
-            "FileLoader: provide LS-DYNA CSV results in "
-            f"'{self._data_dir}' and implement parsing here."
-        )
+        data = self._load_csv("snapshot.csv")
+        return {
+            "t_sep": self._meta["t_sep"],
+            "R_c":   self._meta["R_c_sep"],
+            "R_s":   self._meta["R_s_sep"],
+            "r":     data[:, 0],
+            "rho":   data[:, 1],
+            "u":     data[:, 2],
+            "P":     data[:, 3],
+        }
 
     def contact_pressure_history(self) -> dict:
-        raise NotImplementedError(
-            "FileLoader: contact pressure CSV not yet implemented."
-        )
+        data = self._load_csv("contact.csv")
+        return {
+            "t":   data[:, 0],
+            "P_c": data[:, 1],
+            "u_c": data[:, 2],
+            "R_c": data[:, 3],
+        }
 
     def shock_radius_history(self) -> dict:
-        raise NotImplementedError(
-            "FileLoader: shock radius CSV not yet implemented."
-        )
+        data = self._load_csv("shock.csv")
+        return {
+            "t":   data[:, 0],
+            "R_s": data[:, 1],
+            "D_s": data[:, 2],
+        }
