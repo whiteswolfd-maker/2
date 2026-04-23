@@ -1880,44 +1880,6 @@ $     NSID       CID      DOFX      DOFY      DOFZ     DOFRX     DOFRY     DOFRZ
 $     NSID       CID      DOFX      DOFY      DOFZ     DOFRX     DOFRY     DOFRZ
          2         0         0         1         1         1         1         1
 $
-$ =========== TRACERS ===========
-$
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         1         2         0         0       0.0         0
-$        X         Y         Z
-   52.7118    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         2         2         0         0       0.0         0
-$        X         Y         Z
-  100.0000    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         3         2         0         0       0.0         0
-$        X         Y         Z
-  200.0000    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         4         2         0         0       0.0         0
-$        X         Y         Z
-  400.0000    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         5         2         0         0       0.0         0
-$        X         Y         Z
-  800.0000    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         6         2         0         0       0.0         0
-$        X         Y         Z
- 1500.0000    0.5000       0.0
-*DATABASE_TRACER
-$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
-         7         2         0         0       0.0         0
-$        X         Y         Z
- 3000.0000    0.5000       0.0
-$
 *HOURGLASS
 $     HGID       IHQ        QH
          1         4    0.1000

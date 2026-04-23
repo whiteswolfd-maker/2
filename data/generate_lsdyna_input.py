@@ -257,18 +257,8 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int) -> None:
     L.append("$     NSID       CID      DOFX      DOFY      DOFZ     DOFRX     DOFRY     DOFRZ")
     L.append(f"{_i10(2)}{_i10(0)}{_i10(0)}{_i10(1)}{_i10(1)}{_i10(1)}{_i10(1)}{_i10(1)}")
 
-    # ---- Tracers
-    L.append("$")
-    L.append("$ =========== TRACERS ===========")
-    L.append("$")
-    for i, r_mm in enumerate([u["R0_mm"], 100, 200, 400, 800, 1500, 3000], start=1):
-        if r_mm > u["R_far_mm"]:
-            continue
-        L.append("*DATABASE_TRACER")
-        L.append("$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID")
-        L.append(f"{_i10(i)}{_i10(2)}{_i10(0)}{_i10(0)}{_f10(0.0)}{_i10(0)}")
-        L.append("$        X         Y         Z")
-        L.append(f"{_f10(r_mm)}{_f10(0.5)}{_f10(0.0)}")
+    # ---- Tracers: disabled (d3plot has full-field data; post-process instead)
+    # *DATABASE_TRACER format varies across LS-DYNA versions; skip for simplicity.
 
     # ---- Hourglass
     L.append("$")
