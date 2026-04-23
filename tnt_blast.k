@@ -4,7 +4,9 @@ TNT Spherical Blast 1kg (g-mm-ms)
 $
 *CONTROL_ALE
 $      DCT      NADV      METH      AFAC      BFAC      CFAC      DFAC      EFAC
-         2         1         3   -1.0000       0.0       0.0       0.0       0.0
+         2         1         2   -1.0000       0.0       0.0       0.0       0.0
+$    START       END     AAFAC     VFACT      PRIT       EBC      PREF   NSIDEBC
+       0.0       0.0    1.0000 1.000E-06         0         0       0.0         0
 *CONTROL_TERMINATION
 $   ENDTIM    ENDCYC     DTMIN    ENDENG    ENDMAS
    15.0000         0       0.0       0.0       0.0
@@ -1881,19 +1883,40 @@ $
 $ =========== TRACERS ===========
 $
 *DATABASE_TRACER
-         1         2   52.7118    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         1         2         0         0       0.0         0
+$        X         Y         Z
+   52.7118    0.5000       0.0
 *DATABASE_TRACER
-         2         2  100.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         2         2         0         0       0.0         0
+$        X         Y         Z
+  100.0000    0.5000       0.0
 *DATABASE_TRACER
-         3         2  200.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         3         2         0         0       0.0         0
+$        X         Y         Z
+  200.0000    0.5000       0.0
 *DATABASE_TRACER
-         4         2  400.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         4         2         0         0       0.0         0
+$        X         Y         Z
+  400.0000    0.5000       0.0
 *DATABASE_TRACER
-         5         2  800.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         5         2         0         0       0.0         0
+$        X         Y         Z
+  800.0000    0.5000       0.0
 *DATABASE_TRACER
-         6         2 1500.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         6         2         0         0       0.0         0
+$        X         Y         Z
+ 1500.0000    0.5000       0.0
 *DATABASE_TRACER
-         7         2 3000.0000    0.5000       0.0
+$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID
+         7         2         0         0       0.0         0
+$        X         Y         Z
+ 3000.0000    0.5000       0.0
 $
 *HOURGLASS
 $     HGID       IHQ        QH

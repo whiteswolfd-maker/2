@@ -123,10 +123,12 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int) -> None:
     L.append("TNT Spherical Blast 1kg (g-mm-ms)")
     L.append("$")
 
-    # ---- Control: ALE (2D axisymmetric)
+    # ---- Control: ALE (2D axisymmetric) - needs 2 cards in R12
     L.append("*CONTROL_ALE")
     L.append("$      DCT      NADV      METH      AFAC      BFAC      CFAC      DFAC      EFAC")
-    L.append(f"{_i10(2)}{_i10(1)}{_i10(3)}{_f10(-1.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}")
+    L.append(f"{_i10(2)}{_i10(1)}{_i10(2)}{_f10(-1.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}")
+    L.append("$    START       END     AAFAC     VFACT      PRIT       EBC      PREF   NSIDEBC")
+    L.append(f"{_f10(0.0)}{_f10(0.0)}{_f10(1.0)}{_f10(1.0e-6)}{_i10(0)}{_i10(0)}{_f10(0.0)}{_i10(0)}")
 
     # ---- Control: Termination
     L.append("*CONTROL_TERMINATION")
@@ -263,7 +265,10 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int) -> None:
         if r_mm > u["R_far_mm"]:
             continue
         L.append("*DATABASE_TRACER")
-        L.append(f"{_i10(i)}{_i10(2)}{_f10(r_mm)}{_f10(0.5)}{_f10(0.0)}")
+        L.append("$     TRID     TRACK   AMMG_ID       NID    RADIUS     LOCID")
+        L.append(f"{_i10(i)}{_i10(2)}{_i10(0)}{_i10(0)}{_f10(0.0)}{_i10(0)}")
+        L.append("$        X         Y         Z")
+        L.append(f"{_f10(r_mm)}{_f10(0.5)}{_f10(0.0)}")
 
     # ---- Hourglass
     L.append("$")
