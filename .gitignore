@@ -9,6 +9,7 @@ checkpoints/
 
 # LS-DYNA generated files
 tnt_blast.k
+tnt_blast_3d.k
 d3plot*
 d3thdt*
 d3dump*
