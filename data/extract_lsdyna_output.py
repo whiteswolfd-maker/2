@@ -17,6 +17,7 @@ SI (kg, m, s, Pa) so they plug directly into :class:`FileLoader`.
 Usage
 -----
     python -m data.extract_lsdyna_output --d3plot /path/to/d3plot --out-dir lsdyna_data/
+    python -m data.extract_lsdyna_output --d3plot /path/to/d3plot --debug
 
 Requires ``lasso-python`` (pip install lasso-python).
 """
@@ -49,7 +50,6 @@ PRES_TO_SI = 1.0e6       # MPa    -> Pa
 
 
 def _is_solid(d3: D3plot) -> bool:
-    """Return True if the d3plot contains solid (hex) elements, else shells."""
     return ArrayType.element_solid_node_indexes in d3.arrays
 
 
@@ -80,67 +80,49 @@ def _history_vars(d3: D3plot, state: int):
         return None
 
 
-# ===================== LS-DYNA d3plot extraction =====================
+# ===================== Coordinate helpers =====================
 
 
-def load_d3plot(d3plot_path: str) -> D3plot:
-    print(f"[extract] loading d3plot: {d3plot_path}")
-    # Load WITHOUT state_array_filter so global_timesteps is included.
-    d3 = D3plot(d3plot_path)
+def _node_coords(d3: D3plot, state: int) -> np.ndarray:
+    """Return current node coordinates at ``state``.
 
-    times = d3.arrays.get(ArrayType.global_timesteps)
-    if times is None:
-        raise RuntimeError(
-            "d3plot has no timestep data.  Available keys: "
-            + ", ".join(sorted(str(k) for k in d3.arrays.keys()))
-        )
-    n_states = times.shape[0]
+    For MMALE/Eulerian (solid) elements the mesh is fixed, so we use
+    the initial coordinates only.  For Lagrangian shells we add the
+    node displacement.
+    """
+    X0 = d3.arrays[ArrayType.node_coordinates]
 
-    is_solid = _is_solid(d3)
-    conn = _conn(d3)
-    n_elem = conn.shape[0]
-    elem_type = "solid (hex8)" if is_solid else "shell"
-    print(f"[extract]   states: {n_states}, {elem_type} elements: {n_elem}")
-    return d3
+    if _is_solid(d3):
+        # Eulerian mesh: nodes don't move
+        return X0
+
+    disp = d3.arrays.get(ArrayType.node_displacement)
+    if disp is not None:
+        return X0 + disp[state]
+    return X0
 
 
 def element_centroids_r(d3: D3plot, state: int) -> np.ndarray:
-    """Radial coordinate (mm) of each element's centroid at ``state``.
-
-    For both 2D (shell, r = x) and 3D (solid, r = sqrt(x²+y²+z²)).
-    """
-    X0 = d3.arrays[ArrayType.node_coordinates]             # (N_node, 3)
-
-    disp_arr = d3.arrays.get(ArrayType.node_displacement)
-    if disp_arr is not None:
-        X = X0 + disp_arr[state]
-    else:
-        X = X0
-
-    conn = _conn(d3)  # (N_ele, 4 or 8)
+    """Radial coordinate (mm) of each element's centroid at ``state``."""
+    X = _node_coords(d3, state)
+    conn = _conn(d3)
 
     if _is_solid(d3):
-        # 3D wedge: r = distance from origin
         xc = X[conn, 0].mean(axis=1)
         yc = X[conn, 1].mean(axis=1)
         zc = X[conn, 2].mean(axis=1)
         return np.sqrt(xc**2 + yc**2 + zc**2)
     else:
-        # 2D axisymmetric: r = x coordinate
         return X[conn, 0].mean(axis=1)
 
 
 def element_centroid_velocity_r(d3: D3plot, state: int) -> np.ndarray:
     """Radial velocity (mm/ms) of each element centroid at ``state``."""
-    vel = d3.arrays[ArrayType.node_velocity][state]        # (N_node, 3)
+    vel = d3.arrays[ArrayType.node_velocity][state]
     conn = _conn(d3)
 
     if _is_solid(d3):
-        # 3D: project velocity onto radial direction
-        X0 = d3.arrays[ArrayType.node_coordinates]
-        disp_arr = d3.arrays.get(ArrayType.node_displacement)
-        X = X0 + disp_arr[state] if disp_arr is not None else X0
-
+        X = _node_coords(d3, state)
         xc = X[conn, 0].mean(axis=1)
         yc = X[conn, 1].mean(axis=1)
         zc = X[conn, 2].mean(axis=1)
@@ -149,7 +131,6 @@ def element_centroid_velocity_r(d3: D3plot, state: int) -> np.ndarray:
         vx = vel[conn, 0].mean(axis=1)
         vy = vel[conn, 1].mean(axis=1)
         vz = vel[conn, 2].mean(axis=1)
-        # v_r = v . r_hat
         return (vx * xc + vy * yc + vz * zc) / (rc + 1e-30)
     else:
         return vel[conn, 0].mean(axis=1)
@@ -157,7 +138,7 @@ def element_centroid_velocity_r(d3: D3plot, state: int) -> np.ndarray:
 
 def element_pressure(d3: D3plot, state: int) -> np.ndarray:
     """Scalar pressure (MPa) per element at ``state``."""
-    stress = _stress(d3, state)     # (N_ele, N_ip, 6)
+    stress = _stress(d3, state)
     sxx = stress[..., 0].mean(axis=-1)
     syy = stress[..., 1].mean(axis=-1)
     szz = stress[..., 2].mean(axis=-1)
@@ -216,6 +197,96 @@ def detect_separation_state(times: np.ndarray, P_c: np.ndarray,
     if not below.any():
         return len(times) - 1
     return int(np.where(below)[0].min())
+
+
+# ===================== Debug diagnostics =====================
+
+
+def debug_d3plot(d3plot_path: str) -> None:
+    """Print diagnostic info to help identify data layout issues."""
+    print(f"[debug] loading d3plot: {d3plot_path}")
+    d3 = D3plot(d3plot_path)
+
+    print("\n[debug] === Available arrays ===")
+    for key in sorted(d3.arrays.keys()):
+        arr = d3.arrays[key]
+        if hasattr(arr, "shape"):
+            print(f"  {key:50s}  shape={arr.shape}  dtype={arr.dtype}")
+        else:
+            print(f"  {key:50s}  type={type(arr).__name__}")
+
+    times = d3.arrays.get(ArrayType.global_timesteps)
+    if times is not None:
+        print(f"\n[debug] timesteps: {len(times)}, "
+              f"range [{times[0]:.4f}, {times[-1]:.4f}] ms")
+
+    is_solid = _is_solid(d3)
+    print(f"\n[debug] element type: {'solid (hex8)' if is_solid else 'shell'}")
+
+    conn = _conn(d3)
+    print(f"[debug] elements: {conn.shape[0]}, "
+          f"nodes per elem: {conn.shape[1]}")
+
+    part_ids = _part_ids(d3)
+    for pid in np.unique(part_ids):
+        count = (part_ids == pid).sum()
+        print(f"[debug] part_index={pid}: {count} elements")
+
+    # Sample coordinates at state 0
+    X0 = d3.arrays[ArrayType.node_coordinates]
+    print(f"\n[debug] node_coordinates shape: {X0.shape}")
+    print(f"[debug] first 4 nodes (X0):")
+    for i in range(min(4, X0.shape[0])):
+        print(f"  node {i}: ({X0[i,0]:.4f}, {X0[i,1]:.4f}, {X0[i,2]:.4f})")
+
+    disp = d3.arrays.get(ArrayType.node_displacement)
+    if disp is not None:
+        print(f"\n[debug] node_displacement shape: {disp.shape}")
+        print(f"[debug] displacement at state 0, first 4 nodes:")
+        for i in range(min(4, disp.shape[1])):
+            d0 = disp[0, i]
+            print(f"  node {i}: ({d0[0]:.4f}, {d0[1]:.4f}, {d0[2]:.4f})")
+    else:
+        print("\n[debug] node_displacement: NOT AVAILABLE")
+
+    # Centroids (using initial coords only for debug)
+    r_initial = element_centroids_r(d3, 0)
+    print(f"\n[debug] element centroids (r, mm) at state 0 (initial coords):")
+    print(f"  min={r_initial.min():.4f}, max={r_initial.max():.4f}")
+    print(f"  TNT (part 0): min={r_initial[part_ids==0].min():.4f}, "
+          f"max={r_initial[part_ids==0].max():.4f}")
+    if (part_ids > 0).any():
+        print(f"  Air (part 1): min={r_initial[part_ids==1].min():.4f}, "
+              f"max={r_initial[part_ids==1].max():.4f}")
+
+    # Sample stress and pressure at mid-simulation
+    mid = len(times) // 2 if times is not None else 0
+    print(f"\n[debug] === State {mid} (t = {times[mid]:.4f} ms) ===")
+    try:
+        stress = _stress(d3, mid)
+        print(f"[debug] stress shape: {stress.shape}")
+        P = element_pressure(d3, mid)
+        print(f"[debug] pressure: min={P.min():.6f}, max={P.max():.6f}, "
+              f"mean={P.mean():.6f} MPa")
+        print(f"[debug] pressure at first 5 elements: "
+              f"{P[:5]}")
+        print(f"[debug] pressure at last 5 elements:  "
+              f"{P[-5:]}")
+        # How many elements have P > ambient?
+        n_above = (P > 0.101325).sum()
+        print(f"[debug] elements with P > P_a: {n_above} / {len(P)}")
+    except Exception as e:
+        print(f"[debug] stress error: {e}")
+
+    # History variables
+    hv = _history_vars(d3, mid)
+    if hv is not None:
+        print(f"\n[debug] history variables shape: {hv.shape}")
+        print(f"[debug] HV[0] (first elem): {hv[0] if hv.ndim <= 2 else hv[0,0]}")
+    else:
+        print("\n[debug] history variables: NOT AVAILABLE")
+
+    print("\n[debug] done.")
 
 
 # ===================== Main extraction pipeline =====================
@@ -320,14 +391,40 @@ def extract(d3plot_path: str, out_dir: Path) -> None:
     print(f"[extract] wrote {out_dir / 'metadata.json'}: {meta}")
 
 
+def load_d3plot(d3plot_path: str) -> D3plot:
+    print(f"[extract] loading d3plot: {d3plot_path}")
+    d3 = D3plot(d3plot_path)
+
+    times = d3.arrays.get(ArrayType.global_timesteps)
+    if times is None:
+        raise RuntimeError(
+            "d3plot has no timestep data.  Available keys: "
+            + ", ".join(sorted(str(k) for k in d3.arrays.keys()))
+        )
+    n_states = times.shape[0]
+
+    is_solid = _is_solid(d3)
+    conn = _conn(d3)
+    n_elem = conn.shape[0]
+    elem_type = "solid (hex8)" if is_solid else "shell"
+    print(f"[extract]   states: {n_states}, {elem_type} elements: {n_elem}")
+    return d3
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Extract PINN training data from LS-DYNA d3plot",
     )
     p.add_argument("--d3plot", required=True, help="path to d3plot file")
     p.add_argument("--out-dir", default="lsdyna_data", help="output directory")
+    p.add_argument("--debug", action="store_true",
+                   help="print diagnostics and exit (no CSV output)")
     args = p.parse_args()
-    extract(args.d3plot, Path(args.out_dir))
+
+    if args.debug:
+        debug_d3plot(args.d3plot)
+    else:
+        extract(args.d3plot, Path(args.out_dir))
 
 
 if __name__ == "__main__":
