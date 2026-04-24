@@ -4,9 +4,9 @@ TNT Spherical Blast 1kg – 3D Wedge 2deg (g-mm-ms)
 $
 *CONTROL_ALE
 $      DCT      NADV      METH      AFAC      BFAC      CFAC      DFAC      EFAC
-         2         1         2       0.0       0.0       0.0       0.0       0.0
+        -1         1         2   -1.0000       0.0       0.0       0.0       0.0
 $    START       END     AAFAC     VFACT      PRIT       EBC      PREF   NSIDEBC
-       0.0       0.0       0.0 1.000E-06         0         0       0.0         0
+       0.0       0.0    1.0000 1.000E-06         0         0       0.0         0
 *CONTROL_TERMINATION
 $   ENDTIM    ENDCYC     DTMIN    ENDENG    ENDMAS
    15.0000         0       0.0       0.0       0.0
@@ -53,7 +53,7 @@ $ =========== SECTION ===========
 $
 *SECTION_SOLID
 $    SECID    ELFORM       AET
-         1        12         0
+         1        11         0
 $
 *PART
 TNT explosive
@@ -64,12 +64,25 @@ Air
 $      PID     SECID       MID     EOSID      HGID      GRAV    ADPOPT      TMID
          2         1         2         2         0         0         0         0
 $
+$ =========== PART SETS ===========
+$
+*SET_PART_LIST
+$      SID       DA1       DA2       DA3       DA4
+         1       0.0       0.0       0.0       0.0
+$     PID1      PID2      PID3      PID4      PID5      PID6      PID7      PID8
+         1
+*SET_PART_LIST
+$      SID       DA1       DA2       DA3       DA4
+         2       0.0       0.0       0.0       0.0
+$     PID1      PID2      PID3      PID4      PID5      PID6      PID7      PID8
+         2
+$
 $ =========== ALE MULTI-MATERIAL ===========
 $
 *ALE_MULTI-MATERIAL_GROUP
-$      SID    IDTYPE    GPNAME
-         1         1
-         2         1
+$      SID    IDTYPE
+         1         0
+         2         0
 $
 $ =========== NODES ===========
 $

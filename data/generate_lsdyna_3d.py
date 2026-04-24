@@ -188,17 +188,16 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int,
     L.append(f"TNT Spherical Blast 1kg – 3D Wedge {wedge_deg:.0f}deg (g-mm-ms)")
     L.append("$")
 
-    # ---- Control: ALE (3D, Eulerian mesh)
-    # DCT=2 (Eulerian): mesh fixed, material flows through elements.
-    # ELFORM=12 (MMALE) allows multi-material tracking per element.
+    # ---- Control: ALE (3D MMALE)
+    # DCT=-1 for MMALE with multiple materials in same element (R12 default).
     L.append("*CONTROL_ALE")
     L.append("$      DCT      NADV      METH      AFAC      BFAC"
              "      CFAC      DFAC      EFAC")
-    L.append(f"{_i10(2)}{_i10(1)}{_i10(2)}{_f10(0.0)}{_f10(0.0)}"
+    L.append(f"{_i10(-1)}{_i10(1)}{_i10(2)}{_f10(-1.0)}{_f10(0.0)}"
              f"{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}")
     L.append("$    START       END     AAFAC     VFACT      PRIT"
              "       EBC      PREF   NSIDEBC")
-    L.append(f"{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}{_f10(1.0e-6)}"
+    L.append(f"{_f10(0.0)}{_f10(0.0)}{_f10(1.0)}{_f10(1.0e-6)}"
              f"{_i10(0)}{_i10(0)}{_f10(0.0)}{_i10(0)}")
 
     # ---- Control: Termination
@@ -269,13 +268,15 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int,
     L.append("$       E0        V0")
     L.append(f"{_f10(u['E_a'])}{_f10(1.0)}")
 
-    # ---- Section: 3D solid, multi-material ALE (ELFORM=12)
+    # ---- Section: 3D solid, multi-material ALE (ELFORM=11)
+    # ELFORM=11 is the correct "1-point ALE multi-material element".
+    # (ELFORM=12 is single-material + void — NOT what we want.)
     L.append("$")
     L.append("$ =========== SECTION ===========")
     L.append("$")
     L.append("*SECTION_SOLID")
     L.append("$    SECID    ELFORM       AET")
-    L.append(f"{_i10(1)}{_i10(12)}{_i10(0)}")
+    L.append(f"{_i10(1)}{_i10(11)}{_i10(0)}")
 
     # ---- Parts
     L.append("$")
@@ -292,14 +293,31 @@ def write_keyword(path: Path, u: dict, n_tnt: int, n_air: int,
     L.append(f"{_i10(2)}{_i10(1)}{_i10(2)}{_i10(2)}"
              f"{_i10(0)}{_i10(0)}{_i10(0)}{_i10(0)}")
 
-    # ---- ALE multi-material group (both materials in same group)
+    # ---- Part sets (required by *ALE_MULTI-MATERIAL_GROUP)
+    L.append("$")
+    L.append("$ =========== PART SETS ===========")
+    L.append("$")
+    L.append("*SET_PART_LIST")
+    L.append("$      SID       DA1       DA2       DA3       DA4")
+    L.append(f"{_i10(1)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}")
+    L.append("$     PID1      PID2      PID3      PID4      PID5"
+             "      PID6      PID7      PID8")
+    L.append(f"{_i10(1)}")
+    L.append("*SET_PART_LIST")
+    L.append("$      SID       DA1       DA2       DA3       DA4")
+    L.append(f"{_i10(2)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}{_f10(0.0)}")
+    L.append("$     PID1      PID2      PID3      PID4      PID5"
+             "      PID6      PID7      PID8")
+    L.append(f"{_i10(2)}")
+
+    # ---- ALE multi-material group (one group per material, referenced by part set)
     L.append("$")
     L.append("$ =========== ALE MULTI-MATERIAL ===========")
     L.append("$")
     L.append("*ALE_MULTI-MATERIAL_GROUP")
-    L.append("$      SID    IDTYPE    GPNAME")
-    L.append(f"{_i10(1)}{_i10(1)}")
-    L.append(f"{_i10(2)}{_i10(1)}")
+    L.append("$      SID    IDTYPE")
+    L.append(f"{_i10(1)}{_i10(0)}")
+    L.append(f"{_i10(2)}{_i10(0)}")
 
     # ---- Nodes
     L.append("$")
@@ -383,7 +401,7 @@ def main() -> None:
     print(f"     {n_nodes} nodes (4 per radial layer)")
     print(f"     Wedge angle = {args.wedge_deg:.1f} deg")
     print(f"     End time = {u['t_end']:.2f} ms")
-    print(f"     ELFORM=12 (multi-material ALE, true spherical symmetry)")
+    print(f"     ELFORM=11 (multi-material ALE, true spherical symmetry)")
 
 
 if __name__ == "__main__":
