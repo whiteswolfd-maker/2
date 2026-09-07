@@ -21,8 +21,7 @@ extracted_new/
 extracted_test/
 extracted_50mm_hifi/
 extracted_50mm_x4/
-# 其他大型训练数据
-data/
+# 其他大型训练数据 / 生成目录（本仓库 data/ 是源码包，不忽略）
 datasets/
 outputs/
 results/
