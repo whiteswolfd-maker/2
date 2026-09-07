@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated / checkpoint / solver-artifact dirs (not source)
+checkpoints/
+checkpoints_*/
+dataset_100mm/
+decks/
+runs/
+logs/
+*.log
+
+# Obsolete / garbage extraction outputs (superseded or invalid data)
+extracted_100mm/
+extracted_100mm_new/
+extracted_100mm_twin/
+extracted_80mm/
+extracted_new/
+extracted_test/
+extracted_50mm_hifi/
+extracted_50mm_x4/

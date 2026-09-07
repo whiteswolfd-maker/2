@@ -1,0 +1,201 @@
+# Spherical R_0 = 50 mm TNT — single-point coupling, sequential A->B training
+# Units: SI (kg, m, s, Pa, J)
+
+# ------------------ Data source ------------------
+data:
+  # Output of `data.extract_d3plot` — consumed by the trainer / convergence
+  extracted_dir: extracted/
+
+  # === FILL IN BELOW WHEN YOUR LS-DYNA RUN FINISHES =================
+  #
+  # Paste the directory containing your d3plot files (the master d3plot
+  # plus d3plot01, d3plot02, ...).  Then run, in order:
+  #
+  #   python -m data.extract_d3plot --config configs/tnt_spherical_50mm.yaml --debug
+  #     # inspect history-variable slots; pick the one that holds density
+  #     # (look for a column whose values land in [0.1, 3000] kg/m^3),
+  #     # then update `rho_hv_slot` below.
+  #
+  #   python -m data.extract_d3plot --config configs/tnt_spherical_50mm.yaml
+  #   python -m data.d3plot_dataset --check extracted/
+  #   python -m pinn.trainer        --all  --config configs/tnt_spherical_50mm.yaml
+  #   python -m validation.convergence    --config configs/tnt_spherical_50mm.yaml
+  #
+  # ===================================================================
+  d3plot_dir:   F:/tnt/tnt_files/dp0/SYS/MECH/   # <-- LS-DYNA d3plot directory (50mm)
+  rho_hv_slot:  0                      # <-- ALE mixture density slot (auto-detected)
+
+  # Geometry of the LS-DYNA spherical TNT charge.  R_0 is the charge
+  # radius in metres; the simulation models a sphere of mass
+  # M = (4/3) pi rho_TNT R_0^3.  For this project R_0 = 50 mm
+  # (diameter 100 mm) -> M ~= 0.853 kg.
+  R_0:          0.05                   # spherical charge radius (m)
+  x_end:        2.5                    # +x extent of the extracted line (m)
+                                       #   The user's wedge mesh reaches r=5 m;
+                                       #   2.5 m keeps the shock in-domain for
+                                       #   the 1.0 ms simulation.
+  n_x:          2500                   # 1 mm/grid step at x_end=2.5 m
+
+  # R_s / R_c detection thresholds
+  rho_contact_threshold: 100.0         # kg/m^3.  Strong-shock air compresses to
+                                       #   (gamma+1)/(gamma-1) * rho_a = 7.35 kg/m^3,
+                                       #   so the threshold must sit well above that
+                                       #   to flag genuine product-air contact.
+                                       #   Used only as a fallback when vf_tnt_slot
+                                       #   is unset; otherwise the ALE volume
+                                       #   fraction is the robust signal.
+  P_threshold_factor:    2.0           # R_s = outermost x where P > 2.0 * P_atm
+
+  # ALE TNT-product volume-fraction slot(s).  R_c is then "outermost radius
+  # where the SUM of these slots' volume fractions exceeds vf_threshold" --
+  # immune to the rho-vs-shocked-air ambiguity that plagues density-based
+  # detection.  Accepts either an int or a list (use a list when the LS-DYNA
+  # charge is split across multiple TNT parts).  Run extract_d3plot --debug
+  # to see the recommended slots for your model.
+  #
+  # User's model has 7 ALE parts named [air, tnt, 1n1, tnt1, air1, air11,
+  # tnt11], mapping in order onto vf slots 1..7.  TNT-side materials (density
+  # 1630 verified by cell-level scan): tnt(2), 1n1(3, the initiator core
+  # filling r<25 mm), tnt1(4), tnt11(7).  The three 'air' parts are 1, 5, 6.
+  vf_tnt_slot:           [2, 3, 4, 7]       # TNT: tnt(2), 1n1(3), tnt1(4), tnt11(7)
+  vf_threshold:          0.01          # vf_sum > threshold defines product side
+
+# ------------------ Ambient air ------------------
+air:
+  gamma: 1.4
+  rho_a: 1.225
+  P_a:   101325.0
+
+# ------------------ Domain / scales ------------------
+domain:
+  # Phase A non-dim scales (CJ-products order of magnitude)
+  u_ref_A:   2000.0
+  t_ref_A:   1.0e-5
+  r_anchor_A: 1.0e-4           # apex anchor location for L_IC,A (near origin)
+  # Phase B non-dim scales (post-shock air order of magnitude)
+  u_ref_B:   1000.0
+  P_ref_B:   1.0e+6           # YAML 1.1 needs the explicit '+' or it parses as string
+  t_ref_B:   1.0e-3
+  rh_eps:    5.0e-4            # offset for L_RH sampling at r = R_s − 0.5 mm ± eps
+  outflow_scale: 1.0           # divisor for ∂R+/∂r residual (m/s per m)
+
+# ------------------ Network architecture ------------------
+networks:
+  detonation:
+    depth: 6
+    width: 128
+    omega0: 30.0
+  air_shock:
+    net_type:  fourier_mlp
+    depth: 6
+    width: 384
+    num_octaves: 12
+    t_scale: 1.0e-3
+    r_scale: 2.5
+
+# ------------------ Sampling ------------------
+sampling:
+  A:
+    N_data:  4096
+    N_f:     16384
+    N_slope: 256
+  B:
+    N_data:        4096
+    N_f:           16384
+    N_RH:          256
+    N_outflow:     256
+    N_IC_amb:      256
+    contact_repeat: 128
+    shock_frac_B:  0.5
+    shock_band_B:  0.05
+
+    # shock_frac_B / shock_band_B control shock-weighted data sampling.
+
+# D3plot frames 1-3 (t < 8 us) have P=0 artefacts from LS-DYNA
+# *MAT_HIGH_EXPLOSIVE_BURN initialisation.  Exclude them from data loss.
+  t_data_min:  2.0e-6              # skip grid points with t < 2 us (was 8e-6, which removed ALL Phase-A frames for 50mm)
+  rho_min_A:   100.0               # kg/m3 — only train on product-density cells in Phase A
+
+# Temporal margin for PDE / RH sampling in Phase B.
+# The IC at t=t_sep has a spatial discontinuity (products → ambient), creating
+# a corner singularity at (t_sep, R_c).  PDE residuals arbitrarily close to
+# that corner diverge and overwhelm IC_B.  Excluding a thin boundary layer
+# (a few μs) lets the network satisfy the IC without fighting the PDE there.
+  t_margin_B:  5.0e-6              # exclude t ∈ [t_sep, t_sep + 5 μs] from PDE/RH
+
+# Hard-contact-constraint envelope decay scales (exponential)
+  tau_t:       1.0e-6              # 1 μs  — temporal: w(t_sep+1μs) ≈ 0.37
+  tau_r:       1.0e-3              # 1 mm  — spatial:  w(R_c+1mm)  ≈ 0.37
+
+# ------------------ Loss weights ------------------
+loss_weights:
+  A1:
+    data_A:       5.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+  A2:
+    data_A:       2.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+    PDE_A:       10.0
+  B1:
+    data_B: 1.0
+    IC_B:   5.0
+  B2a:
+    # Data + shock physics only — no PDE.  Network learns the basic
+    # flow field without fighting the PDE attractor.
+    data_B:        5.0
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+  B2b:
+    # Add PDE with very low weight — data and RH already established
+    # the flow field; PDE is a gentle physics regulariser.
+    data_B:        5.0
+    PDE_B:         0.01
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+  B2c:
+    # Shock sharpening: moderate PDE weight + low LR
+    data_B:        5.0
+    PDE_B:         0.05
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+
+# ------------------ Training schedule ------------------
+training:
+  device: auto
+  seed: 20260503
+  log_interval: 100
+  checkpoint_dir: checkpoints
+  gate_rel_tol: 0.08            # 8% — Phase A convergence gate
+                                 #   (P from 0D Riemann ≈ 1D spherical,
+                                 #    spherical source terms ~2/r modify the contact state)
+  A1:
+    steps: 5000
+    lr:    1.0e-3
+  A2:
+    steps: 100000
+    lr:    2.0e-5
+  B1:
+    steps: 5000
+    lr:    1.0e-3
+  B2a:
+    steps: 20000
+    lr:    1.0e-5
+  B2b:
+    steps: 60000
+    lr:    1.0e-5
+  B2c:
+    steps: 30000
+    lr:    5.0e-6
+  adaptive:  false
+  grad_clip_B: 1.0
+
+# ------------------ Validation thresholds ------------------
+validation:
+  Rs_error_tol:           0.01
+  Rc_error_tol:           0.02
+  Pshock_error_tol:       0.05
+  cj_pressure_reference:  21.0e+9
+  cj_pressure_tol:        0.10
+  separation_gate_tol:    0.08

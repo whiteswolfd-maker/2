@@ -1,0 +1,123 @@
+# Unified PINN config — Hopkinson-Cranz scaled (tau = t/M^(1/3), Z = r/M^(1/3))
+# Trains ONE DetNet + ONE AirShockNet on merged 50/80/100 mm data.
+# Prediction at arbitrary R_0: scale (t,r) to (tau,Z) via M^(1/3), run inference.
+
+data:
+  radii:
+    - {extracted_dir: extracted/,        R_0: 0.05}
+  t_data_min: 2.0e-6                    # physical seconds (was 8e-6; removed all Phase-A frames for 50mm)
+
+air:
+  gamma: 1.4
+  rho_a: 1.225
+  P_a:   101325.0
+
+domain:
+  # Scaled domain constants (identical for all R_0)
+  tau_sep: 1.112e-5          # s/kg^(1/3)
+  Z_c:     0.117576          # m/kg^(1/3)
+  Z_R0:    0.052712          # m/kg^(1/3)
+  Z_max:   15.0              # physical domain boundary (ΔP ≈ 0)
+  # Phase A
+  u_ref_A:   2000.0
+  t_ref_A:   1.0e-5
+  Z_anchor_A: 0.052712       # CJ anchor at charge surface
+  tau_scale_A: 1.0e-5
+  Z_scale_A:   0.12
+  # Phase B
+  u_ref_B:   1000.0
+  P_ref_B:   1.0e+6
+  t_ref_B:   1.0e-3
+  r_scale_B: 2.64            # data Z range, NOT domain Z_max=15
+  rh_eps:     5.0e-4
+  outflow_scale: 1.0
+
+networks:
+  detonation:
+    depth: 6
+    width: 128
+    omega0: 30.0
+  air_shock:
+    net_type:    gelu_mlp
+    depth:       6
+    width:       512
+    t_scale:     1.0e-3
+    r_scale:     2.64
+
+sampling:
+  A:
+    N_data:  4096
+    N_f:     16384
+    N_slope: 256
+  B:
+    N_data:        4096
+    N_f:           16384
+    N_RH:          256
+    N_outflow:     256
+    N_IC_amb:      256
+    contact_repeat: 128
+    shock_frac_B:  0.8
+    shock_band_B:  0.08
+    shock_mask_B:  0.02
+  t_data_min:  2.0e-6         # per-radius: tau_min = this / M^(1/3) (was 8e-6; starved Phase A data)
+  rho_min_A:   100.0
+  tau_margin_B: 5.0e-6        # s/kg^(1/3)
+  tau_t:       1.0e-6
+  tau_r:       1.0e-3
+
+loss_weights:
+  A1:
+    data_A:       5.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+  A2a:
+    data_A:       2.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+    PDE_A:       10.0
+  A2b:
+    data_A:       2.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+    PDE_A:       10.0
+  B1:
+    data_B: 1.0
+    IC_B:   5.0
+  B2:
+    data_B:        5.0
+    IC_B:          5.0
+    PDE_B:         0.5
+    RH_B:          2.0
+    BC_B_outflow:  0.1
+
+training:
+  device: auto
+  seed: 20260503
+  log_interval: 100
+  checkpoint_dir: checkpoints_unified
+  gate_rel_tol: 0.08
+  A1:
+    steps: 5000
+    lr:    1.0e-3
+  A2a:
+    steps: 50000
+    lr:    5.0e-5
+  A2b:
+    steps: 100000
+    lr:    1.0e-5
+  B1:
+    steps: 5000
+    lr:    1.0e-3
+  B2:
+    steps: 80000
+    lr:    1.0e-4
+  adaptive:  false
+  grad_clip_B: 1.0
+
+validation:
+  Rs_error_tol:           0.01
+  Rc_error_tol:           0.02
+  Pshock_error_tol:       0.05
+  cj_pressure_reference:  21.0e+9
+  cj_pressure_tol:        0.10
+  separation_gate_tol:    0.08

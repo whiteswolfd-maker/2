@@ -1,0 +1,139 @@
+# Spherical R_0 = 100 mm TNT — single-point coupling, sequential A->B training
+# Units: SI (kg, m, s, Pa, J)
+
+# ------------------ Data source ------------------
+data:
+  extracted_dir: extracted_100mm_new/
+  # 100mm run from scripts/gen_tnt_spherical_deck.py + scripts/run_lsdyna.bat
+  d3plot_dir:   runs/100mm_full
+  rho_hv_slot:  0
+
+  R_0:          0.10                   # spherical charge radius (m) → M ≈ 6.828 kg
+  x_end:        2.5
+  n_x:          2500
+
+  rho_contact_threshold: 100.0
+  P_threshold_factor:    2.0
+  vf_tnt_slot:           [1]           # AMMG1 = TNT volume fraction (slot 1)
+  vf_threshold:          0.01
+
+# ------------------ Ambient air ------------------
+air:
+  gamma: 1.4
+  rho_a: 1.225
+  P_a:   101325.0
+
+# ------------------ Domain / scales ------------------
+domain:
+  u_ref_A:   2000.0
+  t_ref_A:   2.5e-5              # scaled ~ t_sep ≈ 21 μs
+  r_anchor_A: 1.0e-4
+  u_ref_B:   1000.0
+  P_ref_B:   1.0e+6
+  t_ref_B:   1.0e-3
+  rh_eps:    5.0e-4
+  outflow_scale: 1.0
+
+# ------------------ Network architecture ------------------
+networks:
+  detonation:
+    depth: 6
+    width: 128
+    omega0: 30.0
+  air_shock:
+    net_type:  fourier_mlp
+    depth: 6
+    width: 384
+    num_octaves: 12
+    t_scale: 1.0e-3
+    r_scale: 2.5
+
+# ------------------ Sampling ------------------
+sampling:
+  A:
+    N_data:  4096
+    N_f:     16384
+    N_slope: 256
+  B:
+    N_data:        4096
+    N_f:           16384
+    N_RH:          256
+    N_outflow:     256
+    N_IC_amb:      256
+    contact_repeat: 128
+    shock_frac_B:  0.5
+    shock_band_B:  0.05
+
+  t_data_min:  8.0e-6
+  rho_min_A:   100.0       # kg/m3 — only train on product-density cells in Phase A
+  t_margin_B:  5.0e-6
+  tau_t:       1.0e-6
+  tau_r:       1.0e-3
+
+# ------------------ Loss weights ------------------
+loss_weights:
+  A1:
+    data_A:       5.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+
+  A2:
+    data_A:       2.0
+    IC_A:         0.1
+    BC_A_slope:   0.001
+
+    PDE_A:       10.0
+  B1:
+    data_B: 1.0
+    IC_B:   5.0
+  B2a:
+    data_B:        5.0
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+  B2b:
+    data_B:        5.0
+    PDE_B:         0.01
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+  B2c:
+    data_B:        5.0
+    PDE_B:         0.05
+    RH_B:          1.0
+    BC_B_outflow:  0.01
+
+# ------------------ Training schedule ------------------
+training:
+  device: auto
+  seed: 20260503
+  log_interval: 100
+  checkpoint_dir: checkpoints_100mm
+  gate_rel_tol: 0.08
+  A1:
+    steps: 5000
+    lr:    1.0e-3
+  A2:
+    steps: 100000
+    lr:    2.0e-5
+  B1:
+    steps: 5000
+    lr:    1.0e-3
+  B2a:
+    steps: 20000
+    lr:    1.0e-5
+  B2b:
+    steps: 60000
+    lr:    1.0e-5
+  B2c:
+    steps: 30000
+    lr:    5.0e-6
+  adaptive:  false
+  grad_clip_B: 1.0
+
+# ------------------ Validation thresholds ------------------
+validation:
+  Rs_error_tol:           0.01
+  Rc_error_tol:           0.02
+  Pshock_error_tol:       0.05
+  cj_pressure_reference:  21.0e+9
+  cj_pressure_tol:        0.10
+  separation_gate_tol:    0.08
