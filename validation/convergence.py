@@ -36,7 +36,9 @@ from physics.cj_state import (
 )
 from pinn.losses.air_shock_loss import AirShockRHLoss
 from pinn.losses.detonation_loss import _interp_rc
-from pinn.networks import HardContactConstrainedASN, HardDetNetConstraint, build_networks
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
+from pinn.coupling import air_contact_density
 
 
 def _load_cfg(path: str) -> dict:
@@ -51,10 +53,8 @@ def _ckpt(cfg: dict, name: str) -> Path:
     return ROOT / cfg["training"]["checkpoint_dir"] / f"{name}.pt"
 
 
-def _load_into(net, path: Path) -> None:
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    net.load_state_dict(state["state_dict"])
-    net.eval()
+def _load_into(net, path: Path):
+    return load_checkpoint(path, net)[0]
 
 
 def _make_sep_bundle(dataset: D3plotLineDataset):
@@ -95,40 +95,22 @@ def run_convergence(config_path: str = "configs/tnt_spherical_50mm.yaml") -> boo
     if not det_ckpt.exists():
         print(f"DetonationNet checkpoint not found: {det_ckpt}")
         return False
-    _load_into(det, det_ckpt)
-
-    # Wrap with hard constraint for evaluation (matches training setup)
-    sm = cfg["sampling"]
-    det_eval = HardDetNetConstraint(
-        det,
-        tau_sep=float(sep.t_sep), Z_c=float(sep.R_c),
-        rho_cj=cj.rho_CJ, u_cj=0.0, P_cj=cj.P_CJ,
-        rho_x=sep.rho_x, u_x=sep.u_x, P_x=sep.P_x,
-        tau_t=float(sm.get("tau_t", 1e-6)),
-        tau_r=float(sm.get("tau_r", 1e-3)),
-        tau_t_cj=float(sm.get("tau_t_cj", 1e-7)),
-        tau_r_cj=float(sm.get("tau_r_cj", 5e-4)),
-        use_contact=False,   # matches new training (analytic contact anchor disabled)
-    )
-
+    det_eval = _load_into(det, det_ckpt)
     results: list[tuple[str, bool, str]] = []
 
-    # ---- Phase A gate: DetNet @ (t_sep, R_c) vs d3plot DATA (u/P pass-fail).
-    # The analytical Sec.4.2.1 planar state (u_x=7316 m/s) over-estimates the
-    # spherical contact velocity ~2.4x, so it is NOT the target — the trainer
-    # gates against the LS-DYNA data (see pinn.trainer._gate_vs_data).  rho is
-    # reported for diagnostics only.
+    # This is a model/data diagnostic at a fixed analytical anchor.
+    # It must not be reported as learned endpoint convergence.
     with torch.no_grad():
         t_p = torch.tensor([[sep.t_sep]], dtype=torch.float32)
         r_p = torch.tensor([[sep.R_c]],   dtype=torch.float32)
-        rho_p, u_p, P_p = det(t_p, r_p)
+        rho_p, u_p, P_p = det_eval(t_p, r_p)
         rho_d, u_d, P_d = dataset.state_at(t_p, r_p)
     rho_err = abs(float(rho_p) - float(rho_d)) / max(abs(float(rho_d)), 1e-10)
     u_err   = abs(float(u_p)   - float(u_d))   / max(abs(float(u_d)), 1.0)
     P_err   = abs(float(P_p)   - float(P_d))   / max(abs(float(P_d)), 1e-10)
     gate_max = max(u_err, P_err)
     gate_tol = val.get("separation_gate_tol", 0.08)
-    results.append(("Phase A gate (DetonationNet @ (t_sep,R_c) vs d3plot, u/P)",
+    results.append(("Phase A endpoint/data agreement (fixed anchor; u/P)",
                     gate_max <= gate_tol,
                     f"max err {100*gate_max:.2f}% (tol {100*gate_tol:.0f}%); "
                     f"rho {100*rho_err:.1f}% diag"))
@@ -164,34 +146,26 @@ def run_convergence(config_path: str = "configs/tnt_spherical_50mm.yaml") -> boo
 
     # ---- Phase B (if AirShockNet checkpoint exists)
     if asn_ckpt.exists():
-        _load_into(asn, asn_ckpt)
-        # Reconstruct hard-constraint wrapper if metadata exists
-        hc_meta_path = _ckpt(cfg, "air_shock_hc_meta")
-        asn_eval = asn
-        if hc_meta_path.exists():
-            hc = torch.load(hc_meta_path, map_location="cpu", weights_only=False)
-            t_sep_val = float(hc["t_sep"]); R_c_val = float(hc["R_c"])
-            asn_eval = HardContactConstrainedASN(
-                asn, tau_sep=t_sep_val, Z_c=R_c_val,
-                target_rho=hc["target_rho"], target_u=hc["target_u"],
-                target_P=hc["target_P"],
-                tau_t=float(hc["tau_t"]), tau_r=float(hc["tau_r"]),
-            )
-            print(f"[hc] loaded hard-constraint wrapper "
-                  f"(tau_t={hc['tau_t']:.1e} s, tau_r={hc['tau_r']:.1e} m)")
+        asn_eval = _load_into(asn, asn_ckpt)
         # Coupling consistency at (t_sep, R_c)
         with torch.no_grad():
             rho_a_pred, u_a_pred, P_a_pred = asn_eval(t_p, r_p)
         _r = float(rho_p); _u = float(u_p); _P = float(P_p)
         _ra = float(rho_a_pred); _ua = float(u_a_pred); _Pa = float(P_a_pred)
         couple_err = max(
-            abs(_ra - _r) / max(_r, 1e-10),
             abs(_ua - _u) / max(abs(_u), 1.0),
             abs(_Pa - _P) / max(_P, 1e-10),
         )
-        results.append(("Connection-point coupling consistency",
+        results.append(("Connection-point u/P continuity",
                         couple_err < 0.01,
                         f"max err {100*couple_err:.2f}% (target < 1%)"))
+
+        rho_air_target = float(air_contact_density(P_p, gamma=air["gamma"],
+                                                   rho_a=air["rho_a"], P_a=air["P_a"]))
+        rho_air_err = abs(_ra - rho_air_target) / max(rho_air_target, 1e-10)
+        results.append(("Initial air-side density vs RH (density may jump)",
+                        rho_air_err < 0.01,
+                        f"air={_ra:.4g}, RH={rho_air_target:.4g}, products={_r:.4g} kg/m^3"))
 
         # Phase B interior d3plot error
         n_samples = 1024

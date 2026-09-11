@@ -11,6 +11,8 @@ from physics.cj_state import TNTParams, compute_cj_state, compute_separation_sta
 from data.d3plot_dataset import D3plotLineDataset
 from pinn.trainer import _load_cfg
 from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
+from pinn.coupling import air_contact_density
 
 
 def henrych_overpressure_MPa(Z):
@@ -45,13 +47,9 @@ det, asn = build_networks(
     rho_ref_B=air["rho_a"], u_ref_B=cfg["domain"]["u_ref_B"],
     P_ref_B=cfg["domain"]["P_ref_B"],
 )
-det.load_state_dict(torch.load("checkpoints/detonation.pt",
-                    map_location="cpu", weights_only=False)["state_dict"])
-det.eval()
+det, _ = load_checkpoint("checkpoints/detonation.pt", det)
 
-# Gate is against the LS-DYNA DATA at (t_sep, R_c), not the analytical
-# Sec.4.2.1 planar state: u_x=7316 over-estimates the spherical contact
-# velocity ~2.4x, so a data-trained DetNet would always "fail" that target.
+# Fixed-endpoint data agreement is diagnostic, not learned convergence.
 with torch.no_grad():
     t_p = torch.tensor([[sep.t_sep]])
     r_p = torch.tensor([[sep.R_c]])
@@ -65,14 +63,13 @@ pe = abs(float(P_p) - float(P_d)) / max(abs(float(P_d)), 1e-10) * 100
 cc = 0.0
 rho_b = u_b = P_b = None
 if Path("checkpoints/air_shock.pt").exists():
-    asn.load_state_dict(torch.load("checkpoints/air_shock.pt",
-                        map_location="cpu", weights_only=False)["state_dict"])
-    asn.eval()
+    asn, _ = load_checkpoint("checkpoints/air_shock.pt", asn)
     with torch.no_grad():
         rho_b, u_b, P_b = asn(
             torch.tensor([[sep.t_sep]]), torch.tensor([[sep.R_c]]))
     cc = max(
-        abs(float(rho_b) - float(rho_p)) / max(float(rho_p), 1e-10),
+        abs(float(rho_b) - float(air_contact_density(P_p, gamma=air["gamma"],
+            rho_a=air["rho_a"], P_a=air["P_a"]))) / max(float(rho_b), 1e-10),
         abs(float(u_b) - float(u_p)) / max(abs(float(u_p)), 1),
         abs(float(P_b) - float(P_p)) / max(float(P_p), 1e-10),
     )
@@ -154,7 +151,8 @@ a("> 空气: gamma=1.4, rho_a=1.225 kg/m3, P_a=101325 Pa")
 a()
 
 # 2. Gate
-a("## 2. Gate 检查")
+a("## 2. 固定端点与数据的差异")
+a("端点值由解析公式固定；下面的误差不是网络学会端点的收敛证据。")
 a()
 a("DetNet @ (t_sep=%.2f us, R_c=%.1f mm) vs d3plot 数据:" % (sep.t_sep * 1e6, sep.R_c * 1e3))
 a()
@@ -174,7 +172,7 @@ a()
 a("## 3. 耦合一致性")
 a()
 if rho_b is not None:
-    a("AirShockNet vs DetNet @ (t_sep, R_c):")
+    a("A、B 在出流连接点的压力、速度连续；密度分别为产物侧与空气侧。")
     a()
     a("| | DetNet | AirShock |")
     a("|---|--------|----------|")
@@ -182,14 +180,10 @@ if rho_b is not None:
     a("| u | %.1f m/s | %.1f m/s |" % (float(u_p), float(u_b)))
     a("| P | %.3f MPa | %.3f MPa |" % (float(P_p) / 1e6, float(P_b) / 1e6))
     a()
-    a("**差异: %.1f%% (目标 < 1%%)**" % (cc * 100))
+    a("**压力/速度连续性及空气密度 RH 一致性最大误差: %.1f%% (目标 < 1%%)**" % (cc * 100))
     if cc > 0.5:
-        a()
-        a("> **严重断裂**: AirShockNet 在分离点跳到了空气侧值。")
-        a("> ")
-        a("> **根因**: IC_B 权重 5.0→2.0 降过头，被 PDE_B (权 1.0) "
-          "+ data_B (权 1.0) 在矩形域上的梯度淹没。")
-        a("> **修复**: IC_B 权重 2→10, contact_repeat 16→128, PDE_B 1.0→0.2")
+        a("> 连接条件未满足；检查训练版本、检查点约束和空气侧 RH 状态。")
+
 else:
     a("(AirShockNet checkpoint 不存在)")
 a()

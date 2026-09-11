@@ -14,7 +14,8 @@ import torch
 import yaml
 
 from data.d3plot_dataset import D3plotLineDataset
-from pinn.networks import HardContactConstrainedASN, build_networks
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
 
 # ── Henrych peak overpressure (returns Pa) ───────────────────
 def henrych_dP(Z):
@@ -51,20 +52,9 @@ det, asn = build_networks(
     rho_ref_A=1630.0, u_ref_A=cfg["domain"]["u_ref_A"], P_ref_A=21.0e9,
     rho_ref_B=air["rho_a"], u_ref_B=cfg["domain"]["u_ref_B"], P_ref_B=cfg["domain"]["P_ref_B"],
 )
-det.load_state_dict(torch.load(ROOT / cfg["training"]["checkpoint_dir"] / "detonation.pt",
-                     map_location="cpu", weights_only=False)["state_dict"]); det.eval()
-asn.load_state_dict(torch.load(ROOT / cfg["training"]["checkpoint_dir"] / "air_shock.pt",
-                     map_location="cpu", weights_only=False)["state_dict"]); asn.eval()
-
-hc_meta = ROOT / cfg["training"]["checkpoint_dir"] / "air_shock_hc_meta.pt"
-asn_eval = asn
-if hc_meta.exists():
-    hc = torch.load(hc_meta, map_location="cpu", weights_only=False)
-    asn_eval = HardContactConstrainedASN(
-        asn, tau_sep=float(hc["t_sep"]), Z_c=float(hc["R_c"]),
-        target_rho=hc["target_rho"], target_u=hc["target_u"], target_P=hc["target_P"],
-        tau_t=float(hc["tau_t"]), tau_r=float(hc["tau_r"]),
-    )
+ckpt_dir = ROOT / cfg["training"]["checkpoint_dir"]
+det, _ = load_checkpoint(ckpt_dir / "detonation.pt", det)
+asn_eval, _ = load_checkpoint(ckpt_dir / "air_shock.pt", asn)
 
 R_c = float(dataset.R_c_sep); x_end = dataset.x_end; t_sep = dataset.t_sep; t_end = dataset.t_end
 t_arr = dataset.t_arr.numpy()

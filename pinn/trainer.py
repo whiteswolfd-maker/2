@@ -5,8 +5,9 @@ Training proceeds in two strictly sequential phases:
 Phase A (DetonationNet)
     A1: Adam, L_data,A + L_IC,A + L_BC,A,slope          (data + slope BC + apex)
     A2: Adam, + L_PDE,A                                  (add JWL spherical Euler)
-    Gate: DetonationNet(t_sep, R_c) vs analytical Sec.4.2.1 (P_x, u_x, rho_x);
-          if relative error > tol, return to A2 for further training.
+    Hard endpoint: analytical products-side outflow state.
+    Endpoint vs d3plot: model/data diagnostic, not a convergence test of a
+          value that has already been fixed by construction.
     Freeze: DetonationNet weights frozen; cached at (t_sep, R_c).
 
 Phase B (AirShockNet)
@@ -61,6 +62,8 @@ from pinn.losses.air_shock_loss import (
     AirShockPDELoss,
     AirShockRHLoss,
 )
+from pinn.checkpoints import constraint_metadata, load_checkpoint, save_checkpoint
+from pinn.coupling import air_contact_density
 
 
 # ============================================================ utilities
@@ -84,17 +87,33 @@ def _ckpt_path(cfg: dict, name: str) -> Path:
     return p / f"{name}.pt"
 
 
-def _save_checkpoint(path: Path, net, step: int, loss: float) -> None:
-    torch.save({"step": step, "loss": loss, "state_dict": net.state_dict()}, path)
+def _save_checkpoint(path: Path, net, step: int, loss: float, *, training_complete=False) -> None:
+    save_checkpoint(path, net, step, loss, training_complete=training_complete)
     print(f"  [checkpoint] saved -> {path}  (step={step}, loss={loss:.4e})")
 
 
-def _load_checkpoint(path: Path, net) -> int:
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    net.load_state_dict(ckpt["state_dict"])
+def _load_checkpoint(path: Path, net):
+    net, ckpt = load_checkpoint(path, net, require_constraints=True)
     print(f"  [checkpoint] loaded <- {path}  (step={ckpt['step']}, "
           f"loss={ckpt['loss']:.4e})")
-    return ckpt["step"]
+    return net, ckpt
+
+
+def _constrain_detonation(cfg, dataset, sep, det, device):
+    """One definition of the A anchors for training and B-only loading."""
+    sm = cfg["sampling"]
+    cj = sep.cj_bundle
+    return HardDetNetConstraint(
+        det,
+        tau_sep=float(getattr(dataset, "tau_sep", sep.t_sep)),
+        Z_c=float(getattr(dataset, "Z_c", sep.R_c)),
+        Z_R0=float(getattr(dataset, "Z_R0", sep.R_0)),
+        rho_cj=cj.rho_CJ, u_cj=0.0, P_cj=cj.P_CJ,
+        rho_x=sep.rho_x, u_x=sep.u_x, P_x=sep.P_x,
+        tau_t=float(sm.get("tau_t", 1e-6)), tau_r=float(sm.get("tau_r", 1e-3)),
+        tau_t_cj=float(sm.get("tau_t_cj", 1e-7)), tau_r_cj=float(sm.get("tau_r_cj", 5e-4)),
+        use_contact=True,
+    ).to(device)
 
 
 def _log(step: int, losses: dict, elapsed: float) -> None:
@@ -140,6 +159,7 @@ def _build_detonation_losses(
 
     rho_min_A = float(sm.get("rho_min_A", 0.0))
     Z_anchor = float(cfg["domain"].get("Z_anchor_A", cfg["domain"].get("r_anchor_A", 0.052712)))
+    Z_anchor = float(getattr(net, "Z_R0", Z_anchor))
 
     return {
         "data_A": DetonationDataLoss(
@@ -218,6 +238,7 @@ def _build_air_shock_losses(
             net, frozen_det,
             t_sep=t_sep, R_c=R_c, x_end=x_end,
             rho_a=air["rho_a"], P_a=air["P_a"],
+            gamma=air["gamma"],
             N_amb=sm_B["N_IC_amb"],
             contact_repeat=sm_B["contact_repeat"],
             u_ref=cfg["domain"]["u_ref_B"],
@@ -387,16 +408,10 @@ def _run_substage(
 
 
 def _gate_vs_data(det, dataset, tau_sep, Z_c, device, tol: float) -> float:
-    """Gate: compare the raw DetNet at the freeze point (t_sep, R_c) against d3plot.
+    """Report fixed endpoint vs data; this does not measure learned convergence.
 
-    The gate target is the LS-DYNA data, NOT the analytical Sec.4.2.1 state:
-    that planar Riemann value over-estimates the spherical contact velocity
-    ~2.4x (data ~3000 m/s vs analytical 7316 m/s).  u and P are used for the
-    pass/fail (node velocity / cell stress are reliable); rho is reported for
-    diagnostics only — the density near the contact interface is noisy even
-    though the far-field slot passes the mass-conservation check (0.99x).
-
-    Returns max relative error over (u, P).
+    An error here may indicate timing, interface interpolation or model
+    mismatch. More optimizer steps cannot change a hard endpoint value.
     """
     with torch.no_grad():
         tau_p = torch.tensor([[tau_sep]], device=device, dtype=torch.float32)
@@ -406,7 +421,7 @@ def _gate_vs_data(det, dataset, tau_sep, Z_c, device, tol: float) -> float:
     u_err   = abs(float(u_p) - float(u_d)) / max(abs(float(u_d)), 1.0)
     P_err   = abs(float(P_p) - float(P_d)) / max(abs(float(P_d)), 1.0)
     rho_err = abs(float(rho_p) - float(rho_d)) / max(abs(float(rho_d)), 1.0)
-    print(f"  [gate] DetNet @ (t_sep, R_c) vs d3plot data "
+    print(f"  [endpoint-data diagnostic] A @ (t_sep, R_c) vs d3plot data "
           f"(tol={100*tol:.0f}% on u,P):")
     print(f"    rho: pred={float(rho_p):8.1f}  data={float(rho_d):8.1f}  "
           f"err={100*rho_err:6.1f}%   (diagnostic only)")
@@ -421,60 +436,35 @@ def _gate_vs_data(det, dataset, tau_sep, Z_c, device, tol: float) -> float:
 
 
 def train_detonation(cfg: dict, dataset: D3plotLineDataset, sep_bundle,
-                     device: torch.device) -> DetonationNet:
+                     device: torch.device) -> HardDetNetConstraint:
     cj = sep_bundle.cj_bundle
     tau_sep_gate = float(getattr(dataset, "tau_sep", sep_bundle.t_sep))
     Z_c_gate = float(getattr(dataset, "Z_c", sep_bundle.R_c))
     print(f"\n=== Phase A — DetonationNet "
           f"(tau_sep={tau_sep_gate*1e6:.2f}, Z_c={Z_c_gate:.4f}) ===")
 
-    ckpt_path = _ckpt_path(cfg, "detonation")
-    if ckpt_path.exists():
-        det, _ = build_networks(
-            cfg["networks"],
-            rho_ref_A=cj.rho_CJ, u_ref_A=cfg["domain"]["u_ref_A"], P_ref_A=cj.P_CJ,
-        )
-        _load_checkpoint(ckpt_path, det)
-        det = det.to(device)
-        gate_tol = cfg["training"]["gate_rel_tol"]
-        max_err = _gate_vs_data(det, dataset, tau_sep_gate, Z_c_gate, device, gate_tol)
-        if max_err <= gate_tol:
-            print(f"  [gate] PASSED (max err {100*max_err:.2f}%); skipping Phase A")
-            return det
-        print(f"  [gate] FAILED on loaded checkpoint (max err {100*max_err:.2f}% > "
-              f"{100*gate_tol:.0f}%); re-training...")
-
     det, _ = build_networks(
         cfg["networks"],
         rho_ref_A=cj.rho_CJ, u_ref_A=cfg["domain"]["u_ref_A"], P_ref_A=cj.P_CJ,
     )
     det = det.to(device)
-
-    # Hard-constraint wrapper: enforce CJ at (tau=0, Z=Z_R0) + contact at (tau_sep, Z_c)
-    sm = cfg["sampling"]
-    tau_sep = float(getattr(dataset, "tau_sep", sep_bundle.t_sep))
-    Z_c = float(getattr(dataset, "Z_c", sep_bundle.R_c))
-    # Charge-surface coordinate in the net's input units: authoritative from the
-    # dataset (physical R_0 for D3plotLineDataset, scaled Z_R0 for
-    # MultiRadiusDataset).  Fall back to the config only when neither exists.
-    Z_R0 = float(getattr(dataset, "Z_R0", None) or cfg["domain"].get("Z_R0", 0.052712))
-    det_train = HardDetNetConstraint(
-        det,
-        tau_sep=tau_sep, Z_c=Z_c, Z_R0=Z_R0,
-        rho_cj=cj.rho_CJ, u_cj=0.0, P_cj=cj.P_CJ,
-        rho_x=sep_bundle.rho_x, u_x=sep_bundle.u_x, P_x=sep_bundle.P_x,
-        tau_t   = float(sm.get("tau_t", 1e-6)),
-        tau_r   = float(sm.get("tau_r", 1e-3)),
-        tau_t_cj= float(sm.get("tau_t_cj", 1e-7)),
-        tau_r_cj= float(sm.get("tau_r_cj", 5e-4)),
-        # The analytic contact anchor (rho_x, u_x, P_x) is the planar Riemann
-        # value: u_x=7316 over-estimates the spherical contact velocity ~2.4x
-        # (data shows ~3000 m/s, the energy bound).  Pinning the freeze point
-        # to it pollutes the data-driven DetNet output, so we disable it.
-        use_contact=False,
-    )
-    print(f"  [hard-CJ] CJ(tau=0,Z={Z_R0:.4f}) hard constraint active "
-          f"(analytic contact anchor DISABLED — freeze point is data-driven)")
+    det_train = _constrain_detonation(cfg, dataset, sep_bundle, det, device)
+    expected_constraint = constraint_metadata(det_train)
+    tau_sep, Z_c = det_train.tau_sep, det_train.Z_c
+    ckpt_path = _ckpt_path(cfg, "detonation")
+    if ckpt_path.exists():
+        saved = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        # A fixed endpoint cannot be used to decide whether a raw/old model
+        # has converged. Reuse only completed snapshots of this constraint.
+        if saved.get("training_complete") and saved.get("constraint") == expected_constraint:
+            restored, _ = _load_checkpoint(ckpt_path, det)
+            _gate_vs_data(restored, dataset, tau_sep, Z_c, device,
+                          cfg["training"]["gate_rel_tol"])
+            print("  [checkpoint] reusing completed A snapshot with matching constraints")
+            return restored
+        print("  [checkpoint] legacy/incomplete/different A constraints; training a new A model")
+    print(f"  [hard-A] CJ and analytical products-side outflow anchors active; "
+          f"end=(tau={tau_sep:.6g}, Z={Z_c:.6g})")
 
     losses = _build_detonation_losses(cfg, dataset, det_train, sep_bundle, device)
     weights_A1 = cfg["loss_weights"]["A1"]
@@ -508,7 +498,7 @@ def train_detonation(cfg: dict, dataset: D3plotLineDataset, sep_bundle,
                       weights=w2b, steps=A2b["steps"], lr=A2b["lr"],
                       log_n=cfg["training"].get("log_interval", 100),
                       best_ckpt=str(_ckpt_path(cfg, "detonation_best")),
-                      best_net=det,
+                      best_net=det_train,
                       best_ckpt_key="PDE_A")
         total_A2_steps += A2b["steps"]
 
@@ -522,26 +512,23 @@ def train_detonation(cfg: dict, dataset: D3plotLineDataset, sep_bundle,
                       log_n=cfg["training"].get("log_interval", 100))
         total_A2_steps = A2["steps"]
 
-    # Gate: raw DetNet at (tau_sep, Z_c) vs d3plot data (u/P only; rho slot unverified)
+    # Compare the ACTUAL predictor with data. This fixed-value mismatch is
+    # reported independently of hard-constraint satisfaction and convergence.
     gate_tol = cfg["training"]["gate_rel_tol"]
-    print(f"\n[gate] DetNet @ (tau_sep={tau_sep*1e6:.1f}, Z_c={Z_c:.4f}) vs d3plot:")
-    max_err = _gate_vs_data(det, dataset, tau_sep, Z_c, device, gate_tol)
+    max_err = _gate_vs_data(det_train, dataset, tau_sep, Z_c, device, gate_tol)
     if max_err > gate_tol:
-        print(f"  [WARN] gate FAILED (max err {100*max_err:.2f}% > tol {100*gate_tol:.0f}%); "
-              f"re-run with more A2 steps before training Phase B.")
-    else:
-        print(f"  [OK] gate PASSED (max err {100*max_err:.2f}% <= tol {100*gate_tol:.0f}%).")
-
-    _save_checkpoint(_ckpt_path(cfg, "detonation"), det, A1["steps"] + total_A2_steps,
-                     loss=0.0)
-    return det
+        print("  [WARN] analytical endpoint differs from data beyond tolerance. "
+              "Check event coordinates/material parameters; extra A2 steps cannot fix this anchor.")
+    _save_checkpoint(_ckpt_path(cfg, "detonation"), det_train,
+                     A1["steps"] + total_A2_steps, loss=0.0, training_complete=True)
+    return det_train
 
 
 # ============================================================ Phase B driver
 
 
 def train_airshock(cfg: dict, dataset, sep_bundle,
-                   frozen_det: DetonationNet, device: torch.device) -> AirShockNet:
+                   frozen_det: HardDetNetConstraint, device: torch.device) -> HardContactConstrainedASN:
     tau_sep = float(getattr(dataset, "tau_sep", sep_bundle.t_sep))
     Z_c = float(getattr(dataset, "Z_c", sep_bundle.R_c))
     print(f"\n=== Phase B — AirShockNet "
@@ -556,21 +543,27 @@ def train_airshock(cfg: dict, dataset, sep_bundle,
     )
     asn = asn.to(device)
     frozen_det = frozen_det.to(device)
+    if not isinstance(frozen_det, HardDetNetConstraint):
+        raise ValueError("Phase B requires the constrained A predictor; re-train/load Phase A first.")
+    expected = constraint_metadata(_constrain_detonation(cfg, dataset, sep_bundle,
+                                    frozen_det.net, device))
+    if constraint_metadata(frozen_det) != expected:
+        raise ValueError("Phase B requires A with the current analytical endpoint constraint.")
 
-    # ---- hard contact-constraint: force AirShockNet == frozen DetNet output
-    #      at (t_sep, R_c).  NOT the analytical Sec.4.2.1 state: that planar
-    #      Riemann value over-estimates u_x ~2.4x in spherical geometry (data
-    #      contact velocity ~3000 m/s ≈ energy bound, vs 7316 analytical), so
-    #      the data-trained DetNet output is the physically consistent target.
+    # A supplies products-side u/P at the initial outflow matching point.
+    # The AIR density is obtained from RH, never copied from products.
     with torch.no_grad():
         t_p = torch.tensor([[tau_sep]], device=device, dtype=torch.float32)
         r_p = torch.tensor([[Z_c]],     device=device, dtype=torch.float32)
-        rho_c, u_c, P_c = frozen_det(t_p, r_p)
+        _, u_c, P_c = frozen_det(t_p, r_p)
+        rho_c = air_contact_density(P_c, gamma=cfg["air"]["gamma"],
+                                    rho_a=cfg["air"]["rho_a"], P_a=cfg["air"]["P_a"])
     sm = cfg["sampling"]
     asn_wrapped = HardContactConstrainedASN(
         asn,
         tau_sep=tau_sep, Z_c=Z_c,
         target_rho=rho_c, target_u=u_c, target_P=P_c,
+        density_source="air_rh",
         tau_t=float(sm.get("tau_t", 1e-6)),
         tau_r=float(sm.get("tau_r", 1e-3)),
     )
@@ -600,7 +593,7 @@ def train_airshock(cfg: dict, dataset, sep_bundle,
                       grad_clip=float(cfg["training"].get("grad_clip_B", 1.0)),
                       adaptive=cfg["training"].get("adaptive", False),
                       best_ckpt=str(_ckpt_path(cfg, "air_shock_best")),
-                      best_net=asn)
+                      best_net=asn_wrapped)
         total_steps += B2["steps"]
 
     else:
@@ -627,7 +620,7 @@ def train_airshock(cfg: dict, dataset, sep_bundle,
                           grad_clip=float(cfg["training"].get("grad_clip_B", 1.0)),
                           adaptive=cfg["training"].get("adaptive", True),
                           best_ckpt=str(_ckpt_path(cfg, "air_shock_best")),
-                          best_net=asn)
+                          best_net=asn_wrapped)
             total_steps += B2b["steps"]
 
         # B2c: shock sharpening with moderate PDE weight + lower LR
@@ -640,17 +633,12 @@ def train_airshock(cfg: dict, dataset, sep_bundle,
                           log_n=cfg["training"].get("log_interval", 100),
                           grad_clip=float(cfg["training"].get("grad_clip_B", 1.0)),
                           best_ckpt=str(_ckpt_path(cfg, "air_shock_best")),
-                          best_net=asn)
+                          best_net=asn_wrapped)
             total_steps += B2c["steps"]
 
-    _save_checkpoint(_ckpt_path(cfg, "air_shock"), asn, total_steps, 0.0)
-    torch.save({
-        "t_sep": float(tau_sep), "R_c": float(Z_c),
-        "target_rho": rho_c.detach().cpu(), "target_u": u_c.detach().cpu(),
-        "target_P": P_c.detach().cpu(),
-        "tau_t": float(sm.get("tau_t", 1e-6)), "tau_r": float(sm.get("tau_r", 1e-3)),
-    }, _ckpt_path(cfg, "air_shock_hc_meta"))
-    return asn
+    _save_checkpoint(_ckpt_path(cfg, "air_shock"), asn_wrapped, total_steps,
+                     0.0, training_complete=True)
+    return asn_wrapped
 
 
 # ============================================================ main
@@ -726,7 +714,10 @@ def main() -> None:
             if not ckpt.exists():
                 print(f"[error] {ckpt} not found; run Phase A first.")
                 sys.exit(2)
-            _load_checkpoint(ckpt, det)
+            expected = constraint_metadata(_constrain_detonation(cfg, dataset, sep, det, device))
+            det, saved = _load_checkpoint(ckpt, det)
+            if not saved.get("training_complete") or saved.get("constraint") != expected:
+                raise RuntimeError("Saved A constraints do not match this dataset/config; train A first.")
             det = det.to(device)
         train_airshock(cfg, dataset, sep, det, device)
 
