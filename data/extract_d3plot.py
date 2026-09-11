@@ -1,36 +1,19 @@
-"""Extract a 1D state along the +x axis from LS-DYNA d3plot binary output.
+"""Extract spherical radial profiles and observable events from d3plot.
 
-Reads every d3plot state with ``lasso-python``, filters solid elements whose
-centroids lie within a (y, z) tolerance of the +x ray, sorts by x, and
-linearly interpolates (rho, u_x, P) onto a uniform 1D grid x ∈ [0, x_end].
+Reads frames in bounded batches. Radial fields are averaged in spherical
+shells; CJ candidates use ORIGINAL cell states before averaging.
 
-Detects R_s(t) (shock front, P > 1.05 P_atm) and R_c(t) (product–air contact
-face, density jump above ``rho-contact-threshold``).  Computes
-P_bar_p(t) = (1/R_c) ∫_0^{R_c} P(x, t) dx (trapezoidal).  Computes t_0 from
-R_c=L_0 root, then writes:
+New outputs: events.json, events_summary.txt, event_trajectories.csv,
+cj_candidates.csv and shock_raw.csv. raw_line.npz retains material fractions,
+populated-shell counts, radial cell spans, frame IDs and compact CJ probes.
+Event times use the original DYNA clock. Legacy t_0 is a material-radius
+crossing, NOT a CJ time; legacy t_sep remains a theoretical ODE result.
 
-    extracted/raw_line.npz          (t, x, rho, u, P)  shape (N_t, N_x)
-    extracted/shock.csv             columns: t, R_s
-    extracted/contact.csv           columns: t, R_c
-    extracted/product_pressure.csv  columns: t, P_p_bar
-    extracted/metadata.json         {L_0, t_0, t_end, x_end, rho_TNT, ...}
+Run from the project root:
+    python -m data.extract_d3plot --config configs/tnt_spherical_50mm.yaml
 
-Background: LS-DYNA d3plot does NOT store per-cell density/pressure as named
-arrays.  Pressure must be computed from the stress tensor:
-    P = -(σ_xx + σ_yy + σ_zz) / 3
-Density must be extracted from a history variable slot whose meaning depends
-on the *DATABASE_EXTENT_BINARY card (NEIPH) and the EOS / multi-material
-configuration.  Run with ``--debug`` first to inspect available arrays, then
-re-run specifying ``--rho-hv-slot N`` for the right history-variable slot.
-
-Usage
------
-    # Inspect d3plot structure first (no extraction):
-    python -m data.extract_d3plot --d3plot sim_data/3dTNT1/ --debug
-
-    # Full extraction (after identifying the density slot):
-    python -m data.extract_d3plot --d3plot sim_data/3dTNT1/ \\
-        --out extracted/ --rho-hv-slot 0 --L0 0.025 --x-end 0.5
+History-slot indices depend on the actual material/output setup. Inspect
+with --debug; do not assume a volume fraction is a reaction/burn fraction.
 """
 
 from __future__ import annotations
@@ -43,6 +26,11 @@ from typing import Optional
 
 import numpy as np
 
+from data.event_detection import (
+    EventConfig, PROBE_FIELDS, analyze_events, select_cj_probe,
+    validate_fraction, write_event_outputs,
+)
+
 # np.trapezoid renamed from np.trapz in numpy 2.0; both names exist on 2.x but
 # only the legacy spelling exists on 1.x.  Pick whichever the local install has.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
@@ -51,7 +39,7 @@ _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 # ============================================================ helpers
 
 
-def _count_states(d3plot_dir: Path) -> int:
+def _read_state_times(d3plot_dir: Path) -> np.ndarray:
     """True number of output states in the d3plot family.
 
     The old code counted ``d3plotNN`` files, which is only correct when each
@@ -64,7 +52,11 @@ def _count_states(d3plot_dir: Path) -> int:
     master = d3plot_dir / "d3plot"
     d3 = D3plot(str(master), buffered_reading=True,
                 state_array_filter=[ArrayType.global_timesteps])
-    return int(len(d3.arrays[ArrayType.global_timesteps]))
+    return np.asarray(d3.arrays[ArrayType.global_timesteps], dtype=float).copy()
+
+
+def _count_states(d3plot_dir: Path) -> int:
+    return len(_read_state_times(d3plot_dir))
 
 
 def _load_d3plot(d3plot_dir: Path, state_stride: int = 1,
@@ -140,7 +132,7 @@ def _detect_unit_and_axis(d3, ArrayType, override_unit: Optional[str] = None,
     """
     nodes = d3.arrays[ArrayType.node_coordinates]
     span = float(max(
-        nodes[:, 0].ptp(), nodes[:, 1].ptp(), nodes[:, 2].ptp(),
+        np.ptp(nodes[:, 0]), np.ptp(nodes[:, 1]), np.ptp(nodes[:, 2]),
     ))
 
     if override_unit is not None:
@@ -320,7 +312,25 @@ def _print_debug(d3, ArrayType, scales, axis_sign, unit_key,
 # ============================================================ extraction core
 
 
-def _compute_centroids_and_velocities(d3, ArrayType, state_idx: int) -> tuple[np.ndarray, np.ndarray]:
+def _absolute_coordinates_at_frame_zero(d3, ArrayType) -> bool:
+    """Probe only the actual first output, not the first frame of each batch."""
+    nodes = d3.arrays[ArrayType.node_coordinates]
+    disp = d3.arrays.get(ArrayType.node_displacement)
+    scale = max(float(np.ptp(nodes, axis=0).max()), float(np.abs(nodes).max()), 1e-30)
+    return bool(disp is not None and disp.size and np.abs(disp[0]).max() > 0.01*scale)
+
+
+def _node_positions(d3, ArrayType, state_idx, coordinates_are_absolute=None):
+    nodes = d3.arrays[ArrayType.node_coordinates]
+    disp = d3.arrays.get(ArrayType.node_displacement)
+    if disp is None:
+        return nodes
+    if coordinates_are_absolute is None:
+        coordinates_are_absolute = _absolute_coordinates_at_frame_zero(d3, ArrayType)
+    return disp[state_idx] if coordinates_are_absolute else nodes + disp[state_idx]
+
+
+def _compute_centroids_and_velocities(d3, ArrayType, state_idx: int, coordinates_are_absolute=None) -> tuple[np.ndarray, np.ndarray]:
     """Return (centroids (n_solids, 3), vel_cell (n_solids, 3)) at one state.
 
     Centroid = mean of 8 hex node positions (uses node_coordinates +
@@ -328,27 +338,8 @@ def _compute_centroids_and_velocities(d3, ArrayType, state_idx: int) -> tuple[np
     velocity vectors (all 3 components), per cell — needed to project onto the
     radial direction for the spherical-shell average.
     """
-    nodes0 = d3.arrays[ArrayType.node_coordinates]
-    elem_idx = d3.arrays[ArrayType.element_solid_node_indexes]  # (n_solids, n_per_elem)
-
-    # Use displaced coordinates if available (otherwise undeformed mesh).
-    # CAUTION: some d3plot writers (ANSYS Workbench Explicit Dynamics) store
-    # ABSOLUTE node positions in `node_displacement` instead of a true
-    # displacement.  For a true displacement, state 0 is ~0; for positions it
-    # equals node_coordinates (span-scale magnitude).  Adding the latter to
-    # node_coordinates DOUBLES every radius (50 mm charge -> reported ~99 mm,
-    # mass check 8.6 kg).  Detect and use the array as positions when needed.
-    disp = d3.arrays.get(ArrayType.node_displacement)
-    if disp is not None and disp.shape[0] > state_idx:
-        span = float(max(nodes0[:, 0].ptp(), nodes0[:, 1].ptp(), nodes0[:, 2].ptp()))
-        d0_max = float(np.abs(disp[0]).max()) if disp[0].size else 0.0
-        if d0_max > 0.01 * span:
-            # node_displacement holds positions (not deltas) -> use directly
-            nodes_t = disp[state_idx]
-        else:
-            nodes_t = nodes0 + disp[state_idx]
-    else:
-        nodes_t = nodes0
+    elem_idx = d3.arrays[ArrayType.element_solid_node_indexes]
+    nodes_t = _node_positions(d3, ArrayType, state_idx, coordinates_are_absolute)
 
     # Select first 8 columns (hex8); for tet/wedge/shell take available
     n_per_elem = min(8, elem_idx.shape[1])
@@ -370,6 +361,8 @@ def _extract_state(
     rho_sign: float,
     scales: dict,
     vf_tnt_slot: Optional[list[int]] = None,
+    coordinates_are_absolute=None,
+    center=(0.0, 0.0, 0.0),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Return (centroids, rho, u_r, P, vf_tnt) for one state, all in SI units.
 
@@ -380,9 +373,11 @@ def _extract_state(
     it is the sum of volume fractions over every listed slot (so a TNT charge
     split across N parts can be reduced to a single product-side indicator).
     """
-    centroids, vel_cell = _compute_centroids_and_velocities(d3, ArrayType, state_idx)
+    centroids, vel_cell = _compute_centroids_and_velocities(
+        d3, ArrayType, state_idx, coordinates_are_absolute)
     centroids = centroids.copy()
     centroids *= scales["length"]
+    centroids -= np.asarray(center)
     # Radial velocity: project the cell velocity onto the outward unit vector.
     # This is the correct spherical reduction (the old code used the x-velocity
     # alone, which is only valid on the +x axis).
@@ -402,7 +397,7 @@ def _extract_state(
             "element_solid_history_variables not in d3plot -- need NEIPH > 0 "
             "in *DATABASE_EXTENT_BINARY card to write history variables."
         )
-    if rho_hv_slot >= hv.shape[-1]:
+    if rho_hv_slot < 0 or rho_hv_slot >= hv.shape[-1]:
         raise IndexError(
             f"--rho-hv-slot {rho_hv_slot} out of range; "
             f"history_variables has {hv.shape[-1]} slots. Run --debug first."
@@ -421,6 +416,38 @@ def _extract_state(
             vf_tnt = vf_tnt + hv[state_idx, :, slot]
 
     return centroids, rho, u_r, P, vf_tnt
+
+
+def _event_support(d3, ArrayType, state_idx, centroids, rho, u, P, r_grid,
+                   scales, center, coordinates_are_absolute):
+    """Radial cell spans and counts; filled empty shells retain count zero."""
+    nodes = _node_positions(d3, ArrayType, state_idx, coordinates_are_absolute)
+    connectivity = d3.arrays[ArrayType.element_solid_node_indexes]
+    lower = np.full(len(connectivity), np.inf)
+    upper = np.zeros(len(connectivity))
+    for column in range(min(8, connectivity.shape[1])):
+        vertex_r = np.linalg.norm(nodes[connectivity[:, column]]*scales["length"]-center, axis=1)
+        lower = np.minimum(lower, vertex_r)
+        upper = np.maximum(upper, vertex_r)
+    cell_span = upper-lower
+    radius = np.linalg.norm(centroids, axis=1)
+    valid = np.isfinite(radius+rho+u+P) & (rho > 0) & (radius <= r_grid[-1])
+    indices = np.clip(np.round(radius[valid]/(r_grid[1]-r_grid[0])).astype(int), 0, len(r_grid)-1)
+    count = np.bincount(indices, minlength=len(r_grid))
+    width = np.zeros(len(r_grid))
+    np.maximum.at(width, indices, cell_span[valid])
+    return count, width, cell_span
+
+
+def _read_burn_fraction(d3, ArrayType, state_idx, slot):
+    if slot is None:
+        return None
+    hv = _solid_pick_ipt(d3.arrays.get(ArrayType.element_solid_history_variables))
+    if hv is None or slot < 0 or slot >= hv.shape[-1]:
+        raise ValueError("burn_hv_slot outside available history variables")
+    burn = np.asarray(hv[state_idx, :, slot], dtype=float)
+    validate_fraction(burn, "burn_fraction")
+    return burn
 
 
 def _interpolate_to_grid(
@@ -449,10 +476,11 @@ def _interpolate_to_grid(
     if n_shells == 0:
         raise ValueError("r_grid must be non-empty")
     dr = float(r_grid[1] - r_grid[0]) if n_shells > 1 else 1.0
-    idx = np.clip(np.round(r / dr).astype(int), 0, n_shells - 1)
+    valid_cells = np.isfinite(r+rho+u+P) & (rho > 0) & (r <= r_grid[-1])
+    idx = np.clip(np.round(r[valid_cells] / dr).astype(int), 0, n_shells - 1)
 
     def _shell_avg(values: np.ndarray) -> np.ndarray:
-        s = np.bincount(idx, weights=values, minlength=n_shells)
+        s = np.bincount(idx, weights=values[valid_cells], minlength=n_shells)
         c = np.bincount(idx, minlength=n_shells)
         avg = s / np.maximum(c, 1)
         valid = c > 0
@@ -587,9 +615,9 @@ def _find_t0(times: np.ndarray, R_c: np.ndarray, L_0: float) -> float:
 # ============================================================ main
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Extract 1D +x line from LS-DYNA d3plot for PINN training."
+        description="Extract spherical profiles and separation/CJ candidates from local d3plot."
     )
     p.add_argument("--config", type=Path, default=None,
                    help="YAML config (e.g. configs/tnt_spherical_50mm.yaml). "
@@ -615,7 +643,7 @@ def main():
                    help="Outer +x extent of grid (m).")
     p.add_argument("--n-x", type=int, default=None,
                    help="Number of grid points in x.")
-    p.add_argument("--P-atm", type=float, default=101325.0,
+    p.add_argument("--P-atm", type=float, default=None,
                    help="Ambient pressure (Pa).")
     p.add_argument("--P-threshold-factor", type=float, default=None,
                    help="R_s detection: P > factor x P_atm "
@@ -625,7 +653,7 @@ def main():
                         "must exceed Hugoniot-compressed air ~7.4 kg/m^3 to "
                         "avoid mistaking shocked air for product.  Or set "
                         "data.rho_contact_threshold in yaml).")
-    p.add_argument("--rho-tnt", type=float, default=1630.0,
+    p.add_argument("--rho-tnt", type=float, default=None,
                    help="Initial TNT density (kg/m^3, default 1630).")
     p.add_argument("--state-stride", type=int, default=1,
                    help="Subsample every Nth state to reduce memory (default 1). "
@@ -649,14 +677,32 @@ def main():
                    help="Volume-fraction threshold for R_c detection "
                         "(default 0.01; lower -> picks up the diffuse outer "
                         "edge of the ALE interface).")
-    args = p.parse_args()
+    p.add_argument("--burn-hv-slot", type=int, default=None,
+                   help="Verified [0,1] burn/reaction-progress history slot; optional. "
+                        "Do not use a material volume-fraction slot here.")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Frames per batch (default 2, or data.batch_size).")
+    p.add_argument("--max-time", type=float, default=None,
+                   help="Read only frames up to this ORIGINAL DYNA time in seconds.")
+    p.add_argument("--center", nargs=3, type=float, default=None, metavar=("X", "Y", "Z"),
+                   help="Charge center in SI metres; default data.center or 0 0 0.")
+    p.add_argument("--coordinates-mode", choices=("auto", "absolute", "displacement"),
+                   default="auto", help="Meaning of node_displacement; auto probes frame zero once.")
+    args = p.parse_args(argv)
 
     # Merge config defaults (CLI flags win when explicitly given).
-    cfg_data: dict = {}
+    cfg: dict = {}
     if args.config is not None:
         import yaml
         with open(args.config, encoding="utf-8") as f:
-            cfg_data = (yaml.safe_load(f) or {}).get("data", {}) or {}
+            cfg = yaml.safe_load(f) or {}
+    cfg_data = cfg.get("data", {}) or {}
+    event_options = dict(cfg.get("events", {}) or {})
+    reference_override = event_options.pop("cj_reference", None)
+    try:
+        event_config = EventConfig(**event_options)
+    except (TypeError, ValueError) as exc:
+        p.error(f"Invalid events configuration: {exc}")
 
     def _pick(name: str, cli_value, default):
         if cli_value is not None:
@@ -697,6 +743,24 @@ def main():
     else:
         args.vf_tnt_slot = [int(raw_vf)]
     args.vf_threshold          = _pick("vf_threshold", args.vf_threshold, 0.01)
+    args.burn_hv_slot = _pick("burn_hv_slot", args.burn_hv_slot, None)
+    args.batch_size = _pick("batch_size", args.batch_size, 2)
+    args.center = np.asarray(_pick("center", args.center, [0.0, 0.0, 0.0]), dtype=float)
+    args.P_atm = args.P_atm if args.P_atm is not None else float(cfg.get("air", {}).get("P_a", 101325.0))
+    args.rho_tnt = args.rho_tnt if args.rho_tnt is not None else float(cfg.get("tnt", {}).get("rho_TNT", 1630.0))
+    rho_air = float(cfg.get("air", {}).get("rho_a", 1.225))
+    if args.batch_size < 1 or int(args.batch_size) != args.batch_size or args.state_stride < 1:
+        p.error("batch-size and state-stride must be positive integers")
+    if args.n_x < 4 or not np.isfinite([args.R_0, args.x_end, args.P_atm, rho_air]).all() or not 0 < args.R_0 <= args.x_end:
+        p.error("Require n-x >= 4 and finite 0 < R-0 <= x-end")
+    if args.center.shape != (3,) or not np.isfinite(args.center).all():
+        p.error("center must contain three finite SI coordinates")
+    if args.max_time is not None and (not np.isfinite(args.max_time) or args.max_time < 0):
+        p.error("max-time must be finite and nonnegative")
+    if args.vf_tnt_slot and len(set(args.vf_tnt_slot)) != len(args.vf_tnt_slot):
+        p.error("Duplicate volume-fraction slots would double-count material")
+    if args.burn_hv_slot is not None and args.burn_hv_slot in (args.vf_tnt_slot or []):
+        p.error("burn-hv-slot must not also be a material volume-fraction slot")
 
     if not d3plot_dir.is_dir():
         print(f"ERROR: {d3plot_dir} is not a directory", file=sys.stderr)
@@ -714,6 +778,9 @@ def main():
         override_unit=override_unit,
         override_axis=override_axis,
     )
+    coordinates_are_absolute = (_absolute_coordinates_at_frame_zero(d3, ArrayType)
+                                if args.coordinates_mode == "auto" else
+                                args.coordinates_mode == "absolute")
 
     if args.debug:
         _print_debug(d3, ArrayType, scales, axis_sign, unit_key,
@@ -721,6 +788,8 @@ def main():
         return 0
 
     print(f"[extract] unit system : {scales['label']}")
+    print(f"[extract] coordinates : {'absolute' if coordinates_are_absolute else 'displacement'}; "
+          f"center={args.center.tolist()} m")
     print(f"[extract] radial axis : {'+x' if axis_sign > 0 else '-x'}")
     if args.vf_tnt_slot:
         slots_str = (str(args.vf_tnt_slot[0]) if len(args.vf_tnt_slot) == 1
@@ -732,9 +801,31 @@ def main():
               f"rho > {args.rho_contact_threshold:.1f} kg/m^3")
 
     # ----------- core extraction (batched to bound peak memory) -----------
-    n_total = _count_states(d3plot_dir)
-    n_total = max(n_total, 1)
-    state_indices = list(range(0, n_total, args.state_stride))
+    from physics.cj_state import TNTParams, compute_cj_state, compute_separation_state
+    from physics.uniform_expansion import write_csv as write_uniform_csv
+    tnt_options = dict(cfg.get("tnt", {}) or {})
+    tnt_options.update(rho_TNT=args.rho_tnt, P_atm=args.P_atm, rho_a=rho_air,
+                       gamma_a=float(cfg.get("air", {}).get("gamma", 1.4)))
+    tnt = TNTParams(**tnt_options)
+    cj_b = compute_cj_state(tnt)
+    P_CJ, rho_CJ, u_CJ = cj_b.P_CJ, cj_b.rho_CJ, cj_b.u_CJ
+    cj_reference = dict(P=P_CJ, rho=rho_CJ, u=u_CJ)
+    if reference_override is not None:
+        if set(reference_override) != {"P", "rho", "u"}:
+            p.error("events.cj_reference must contain P, rho and u in SI units")
+        cj_reference = {k: float(v) for k, v in reference_override.items()}
+    if not all(np.isfinite(v) and v > 0 for v in cj_reference.values()):
+        p.error("CJ reference values must be finite and positive")
+    # Release probe arrays before reading large batches.
+    del d3
+    all_times = _read_state_times(d3plot_dir)
+    if not len(all_times) or not np.isfinite(all_times).all() or np.any(np.diff(all_times) <= 0):
+        p.error("d3plot times must be finite and strictly increasing")
+    n_total = len(all_times)
+    state_indices = [i for i in range(0, n_total, args.state_stride)
+                     if args.max_time is None or all_times[i] <= args.max_time]
+    if not state_indices:
+        p.error("No output frames within the selected time range")
     n_states = len(state_indices)
     print(f"[extract] {n_states}/{n_total} states (stride={args.state_stride})")
 
@@ -742,24 +833,44 @@ def main():
     rho_grid = np.zeros((n_states, args.n_x))
     u_grid   = np.zeros((n_states, args.n_x))
     P_grid   = np.zeros((n_states, args.n_x))
+    vf_grid = np.full_like(P_grid, np.nan) if args.vf_tnt_slot else None
+    burn_grid = np.full_like(P_grid, np.nan) if args.burn_hv_slot is not None else None
+    sample_count = np.zeros((n_states, args.n_x), dtype=np.int32)
+    cell_width_grid = np.zeros_like(P_grid)
+    cj_probes = []
     R_s_arr  = np.zeros(n_states)
     R_c_arr  = np.zeros(n_states)
     Pbar_p_arr = np.zeros(n_states)
     times_out = np.zeros(n_states)
 
-    CHUNK = 25          # states loaded at once (~3.4 GB for 1.2M-element models)
+    CHUNK = int(args.batch_size)
     log_every = max(1, n_states // 20)
     k = 0
     for c0 in range(0, n_states, CHUNK):
         chunk = state_indices[c0:c0 + CHUNK]
         d3c, _ = _load_d3plot(d3plot_dir, state_subset=chunk)
         times_c = d3c.arrays[ArrayType.global_timesteps]
+        if len(times_c) != len(chunk) or not np.allclose(times_c, all_times[chunk], rtol=1e-7, atol=0):
+            raise RuntimeError("Loaded frame order/times do not match requested d3plot state IDs")
         for rel, s in enumerate(chunk):
             centroids, rho, u, P, vf = _extract_state(
                 d3c, ArrayType, rel, args.rho_hv_slot, args.rho_sign,
                 scales,
                 vf_tnt_slot=args.vf_tnt_slot,
+                coordinates_are_absolute=coordinates_are_absolute,
+                center=args.center,
             )
+            validate_fraction(vf, "vf_tnt")
+            burn = _read_burn_fraction(d3c, ArrayType, rel, args.burn_hv_slot)
+            count, widths, cell_spans = _event_support(
+                d3c, ArrayType, rel, centroids, rho, u, P, x_grid,
+                scales, args.center, coordinates_are_absolute)
+            sample_count[k], cell_width_grid[k] = count, widths
+            element_ids = d3c.arrays.get("element_solid_ids")
+            cj_probes.append(select_cj_probe(
+                np.linalg.norm(centroids, axis=1), rho, u, P, R_0=args.R_0,
+                reference=cj_reference, config=event_config, vf=vf, burn=burn,
+                sample_ids=element_ids, cell_width=cell_spans))
             rho_g, u_g, P_g, vf_g = _interpolate_to_grid(
                 centroids, rho, u, P,
                 x_grid,          # radial grid (spherical-shell average)
@@ -768,6 +879,11 @@ def main():
             rho_grid[k] = rho_g
             u_grid[k]   = u_g
             P_grid[k]   = P_g
+            if vf_grid is not None:
+                vf_grid[k] = vf_g
+            if burn_grid is not None:
+                # The fourth result is a generic scalar shell average here.
+                burn_grid[k] = _interpolate_to_grid(centroids, rho, u, P, x_grid, burn)[3]
             R_s_arr[k] = _detect_R_s(x_grid, P_g, args.P_atm, args.P_threshold_factor)
             if vf_g is not None:
                 R_c_arr[k] = _detect_R_c_vf(x_grid, vf_g, args.vf_threshold)
@@ -782,24 +898,28 @@ def main():
             k += 1
         del d3c   # free the chunk's arrays before loading the next
 
+    event_report, event_rows, event_probes = analyze_events(
+        times_out, x_grid, rho_grid, u_grid, P_grid, R_0=args.R_0,
+        P_atm=args.P_atm, rho_air=rho_air, reference=cj_reference,
+        vf=vf_grid, burn=burn_grid, sample_count=sample_count,
+        cell_width=cell_width_grid, state_indices=state_indices,
+        cj_probes=cj_probes, config=event_config, source="original_cells_CJ_and_radial_gap")
+    event_report["provenance"] = dict(
+        d3plot_directory=str(d3plot_dir), unit_system=unit_key,
+        center_m=args.center.tolist(), rho_hv_slot=args.rho_hv_slot,
+        vf_tnt_slot=args.vf_tnt_slot, burn_hv_slot=args.burn_hv_slot,
+        coordinates_mode="absolute" if coordinates_are_absolute else "displacement",
+        cj_reference_source="events.cj_reference" if reference_override else "project_CJ_solver",
+        cj_sample_id_kind="solid_element_id" if element_ids is not None else "zero_based_solid_index")
+    write_event_outputs(args.out, event_report, event_rows, event_probes)
+
     # ----------- t_0 -----------
     # The contact face starts at the spherical charge surface r = R_0.
     t_0 = _find_t0(times_out, R_c_arr, args.R_0)
-    print(f"[extract] t_0 (R_c={args.R_0*1e3:.1f} mm) = {t_0:.3e} s")
+    print(f"[extract] legacy contact crossing t_0={t_0:.3e} s (NOT CJ time)")
 
     # ----------- CJ + Sec.4.2.1 separation + Taylor-Sadovsky ODE -----------
     print("[extract] computing CJ + separation state via physics/cj_state.py...")
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from physics.cj_state import (
-        TNTParams,
-        compute_cj_state,
-        compute_separation_state,
-    )
-    from physics.uniform_expansion import write_csv as write_uniform_csv
-
-    tnt = TNTParams(rho_TNT=args.rho_tnt)
-    cj_b = compute_cj_state(tnt)
-    P_CJ = cj_b.P_CJ; rho_CJ = cj_b.rho_CJ; u_CJ = cj_b.u_CJ
     print(f"[extract] CJ: P_CJ={P_CJ/1e9:.3f} GPa, rho_CJ={rho_CJ:.1f} kg/m^3, "
           f"u_CJ={u_CJ:.1f} m/s")
 
@@ -840,10 +960,18 @@ def main():
 
     # ----------- output -----------
     args.out.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        args.out / "raw_line.npz",
-        t=times_out, x=x_grid, rho=rho_grid, u=u_grid, P=P_grid,
-    )
+    extra = dict(sample_count=sample_count, cell_width=cell_width_grid,
+                 state_index=np.asarray(state_indices, dtype=np.int64),
+                 cj_probe=np.array([[probe[key] if probe[key] is not None else np.nan
+                                     for key in PROBE_FIELDS] for probe in cj_probes], dtype=float))
+    if vf_grid is not None:
+        extra["vf_tnt"] = vf_grid
+    if burn_grid is not None:
+        extra["burn_fraction"] = burn_grid
+    np.savez_compressed(args.out / "raw_line.npz", t=times_out, x=x_grid,
+                        rho=rho_grid, u=u_grid, P=P_grid, **extra)
+    np.savetxt(args.out / "shock_raw.csv", np.column_stack([times_out, R_s_arr]),
+               delimiter=",", header="t,R_s_legacy_unsmoothed", comments="")
     # SG-smooth R_s to suppress 1mm-grid quantization noise before computing D_s
     R_s_smooth = _sg_smooth(R_s_arr, window=31, order=3)
     np.savetxt(args.out / "shock.csv",
@@ -878,6 +1006,21 @@ def main():
         "u_x":     sep.u_x,
         "rho_x":   sep.rho_x,
         "V_x":     sep.V_x,
+        "unit_system": unit_key,
+        "center_m": args.center.tolist(),
+        "P_atm": args.P_atm,
+        "rho_air": rho_air,
+        "vf_tnt_slot": args.vf_tnt_slot,
+        "burn_hv_slot": args.burn_hv_slot,
+        "t_0_definition": "legacy_contact_crossing_not_CJ",
+        "t_sep_definition": "theoretical_Taylor_Sadovsky_time_not_detected",
+        "t_sep_detected": event_report["t_sep_detected_s"],
+        "t_cj_candidate": event_report["t_cj_candidate_s"],
+        "events_file": "events.json",
+        "event_criteria": event_report["criteria"],
+        "event_cj_reference": cj_reference,
+        "cj_probe_fields": list(PROBE_FIELDS),
+        "event_provenance": event_report["provenance"],
     }
     with open(args.out / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)

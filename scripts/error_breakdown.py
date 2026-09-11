@@ -9,7 +9,8 @@ import numpy as np
 import yaml
 
 from data.d3plot_dataset import D3plotLineDataset
-from pinn.networks import HardContactConstrainedASN, build_networks
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
 from physics.cj_state import TNTParams, compute_cj_state, compute_separation_state
 
 cfg_path = ROOT / "configs" / "tnt_spherical_50mm.yaml"
@@ -33,22 +34,8 @@ det, asn = build_networks(
 # Load checkpoints
 det_ckpt = ROOT / cfg["training"]["checkpoint_dir"] / "detonation.pt"
 asn_ckpt = ROOT / cfg["training"]["checkpoint_dir"] / "air_shock.pt"
-state = torch.load(det_ckpt, map_location="cpu", weights_only=False)
-det.load_state_dict(state["state_dict"]); det.eval()
-state = torch.load(asn_ckpt, map_location="cpu", weights_only=False)
-asn.load_state_dict(state["state_dict"]); asn.eval()
-
-# Reconstruct hard-constraint wrapper
-hc_meta = ROOT / cfg["training"]["checkpoint_dir"] / "air_shock_hc_meta.pt"
-asn_eval = asn
-if hc_meta.exists():
-    hc = torch.load(hc_meta, map_location="cpu", weights_only=False)
-    asn_eval = HardContactConstrainedASN(
-        asn, tau_sep=float(hc["t_sep"]), Z_c=float(hc["R_c"]),
-        target_rho=hc["target_rho"], target_u=hc["target_u"],
-        target_P=hc["target_P"],
-        tau_t=float(hc["tau_t"]), tau_r=float(hc["tau_r"]),
-    )
+det, _ = load_checkpoint(det_ckpt, det)
+asn_eval, _ = load_checkpoint(asn_ckpt, asn)
 
 t_sep = sep.t_sep; R_c = sep.R_c; x_end = dataset.x_end; t_end = dataset.t_end
 

@@ -28,7 +28,12 @@ from pinn.trainer import (
     _build_air_shock_losses,
     _build_detonation_losses,
     _run_substage,
+    train_detonation,
+    train_airshock,
 )
+from pinn.checkpoints import load_checkpoint
+from pinn.coupling import air_contact_density
+from pinn.networks import HardDetNetConstraint, HardContactConstrainedASN
 
 
 # ============================================================ synthetic data
@@ -202,3 +207,37 @@ def test_spherical_yaml_loads():
     for sub in ("A1", "A2", "B1", "B2a", "B2b"):
         assert sub in cfg["loss_weights"]
         assert sub in cfg["training"]
+
+
+def test_sequential_drivers_preserve_endpoint_across_save_and_reload(smoke, monkeypatch):
+    cfg, ds, sep = smoke
+    device = torch.device("cpu")
+    det = train_detonation(cfg, ds, sep, device)
+    assert isinstance(det, HardDetNetConstraint) and det.use_contact
+    t = torch.tensor([[sep.t_sep]])
+    r = torch.tensor([[sep.R_c]])
+    rho_A, u_A, P_A = det(t, r)
+    for pred, value in zip((rho_A, u_A, P_A), (sep.rho_x, sep.u_x, sep.P_x)):
+        assert float(pred.detach()) == pytest.approx(value, rel=1e-6)
+    asn = train_airshock(cfg, ds, sep, det, device)
+    assert isinstance(asn, HardContactConstrainedASN)
+    rho_B, u_B, P_B = asn(t, r)
+    torch.testing.assert_close(u_A, u_B)
+    torch.testing.assert_close(P_A, P_B)
+    torch.testing.assert_close(rho_B, air_contact_density(P_A, gamma=1.4, rho_a=1.225, P_a=101325.))
+    assert not torch.allclose(rho_A, rho_B)
+    raw_A, raw_B = build_networks(cfg["networks"])
+    ckpt_dir = Path(cfg["training"]["checkpoint_dir"])
+    loaded_A, _ = load_checkpoint(ckpt_dir / "detonation.pt", raw_A, require_constraints=True)
+    loaded_B, _ = load_checkpoint(ckpt_dir / "air_shock.pt", raw_B, require_constraints=True)
+    probe_t = torch.tensor([[sep.t_sep], [sep.t_sep*0.8], [sep.t_sep*1.5]])
+    probe_r = torch.tensor([[sep.R_c], [sep.R_c*0.9], [sep.R_c*1.5]])
+    for net, loaded in ((det, loaded_A), (asn, loaded_B)):
+        for before, after in zip(net(probe_t, probe_r), loaded(probe_t, probe_r)):
+            torch.testing.assert_close(before, after, rtol=0., atol=0.)
+    # Completed A reload must return its wrapper as well.
+    def unexpected_training(*args, **kwargs):
+        pytest.fail("Completed current A snapshot should be reusable")
+    monkeypatch.setattr("pinn.trainer._run_substage", unexpected_training)
+    reused = train_detonation(cfg, ds, sep, device)
+    assert isinstance(reused, HardDetNetConstraint) and reused.use_contact

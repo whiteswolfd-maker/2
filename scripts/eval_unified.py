@@ -8,7 +8,8 @@ sys.path.insert(0, str(ROOT))
 
 from data.d3plot_dataset import D3plotLineDataset
 from data.multi_radius_dataset import _M_third
-from pinn.networks import build_networks, HardDetNetConstraint, HardContactConstrainedASN
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
 from physics.cj_state import TNTParams, compute_cj_state, compute_separation_state
 
 
@@ -26,48 +27,17 @@ def main():
         rho_ref_B=air["rho_a"], u_ref_B=cfg["domain"]["u_ref_B"], P_ref_B=cfg["domain"]["P_ref_B"],
     )
 
-    det.load_state_dict(torch.load(
-        ROOT / "checkpoints_unified/detonation.pt", map_location="cpu", weights_only=False,
-    )["state_dict"])
-    # Use best checkpoint for AirShockNet
-    asn.load_state_dict(torch.load(
-        ROOT / "checkpoints_unified/air_shock_best.pt", map_location="cpu", weights_only=False,
-    )["state_dict"])
-    det.eval(); asn.eval()
-
-    sep0 = compute_separation_state(tnt, R_0=0.05, cj_bundle=cj)
-    sm = cfg["sampling"]
-
-    det_eval = HardDetNetConstraint(
-        det,
-        tau_sep=1.112e-5, Z_c=0.117576, Z_R0=0.052712,
-        rho_cj=cj.rho_CJ, u_cj=0.0, P_cj=cj.P_CJ,
-        rho_x=sep0.rho_x, u_x=sep0.u_x, P_x=sep0.P_x,
-        tau_t=float(sm.get("tau_t", 1e-6)),
-        tau_r=float(sm.get("tau_r", 1e-3)),
-        use_contact=False,   # matches new training (analytic contact anchor disabled)
-    )
-
-    with torch.no_grad():
-        tc = torch.tensor([[1.112e-5]], dtype=torch.float32)
-        rc = torch.tensor([[0.117576]], dtype=torch.float32)
-        rho_c, u_c, P_c = det_eval(tc, rc)
-
-    asn_eval = HardContactConstrainedASN(
-        asn, tau_sep=1.112e-5, Z_c=0.117576,
-        target_rho=rho_c, target_u=u_c, target_P=P_c,
-        tau_t=float(sm.get("tau_t", 1e-6)),
-        tau_r=float(sm.get("tau_r", 1e-3)),
-    )
-
-    # Gate check
-    print(f"Gate: rho={float(rho_c):.1f}  u={float(u_c):.0f}  P={float(P_c)/1e6:.2f} MPa")
-    print(f"      vs analytical rho={sep0.rho_x:.1f}  u={sep0.u_x:.0f}  P={sep0.P_x/1e6:.2f} MPa")
-
+    ckpt_dir = ROOT / cfg["training"]["checkpoint_dir"]
+    det_eval, _ = load_checkpoint(ckpt_dir / "detonation.pt", det, require_constraints=True)
+    air_path = ckpt_dir / "air_shock_best.pt"
+    if not air_path.exists():
+        air_path = ckpt_dir / "air_shock.pt"
+    asn_eval, _ = load_checkpoint(air_path, asn, require_constraints=True)
+    if (asn_eval.tau_sep, asn_eval.Z_c) != (det_eval.tau_sep, det_eval.Z_c):
+        raise RuntimeError("A/B checkpoints use different connection coordinates; re-train B.")
+    TAU_SEP = det_eval.tau_sep
+    Z_C = det_eval.Z_c
     evaluations: list[dict] = []
-
-    TAU_SEP = 1.112e-5     # scaled separation time (constant across radii)
-    Z_C = 0.117576          # scaled contact radius
 
     for spec in cfg["data"]["radii"]:
         R0 = float(spec["R_0"])

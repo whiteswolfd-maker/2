@@ -20,7 +20,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from data.d3plot_dataset import D3plotLineDataset
-from pinn.networks import HardContactConstrainedASN, build_networks
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
+from pinn.coupling import air_contact_density
 from physics.cj_state import compute_separation_state, TNTParams, compute_cj_state
 
 # ----------------------------------------------------------------------
@@ -358,24 +360,12 @@ def main():
 
             ckpt_dir = ROOT / info["checkpoint"]
             asn_pt = ckpt_dir / "air_shock.pt"
-            hc_pt = ckpt_dir / "air_shock_hc_meta.pt"
-            asn_eval = asn
 
             if not asn_pt.exists():
                 print(f"    [SKIP] No checkpoint at {asn_pt}")
                 continue
 
-            asn.load_state_dict(torch.load(str(asn_pt), map_location="cpu", weights_only=False)["state_dict"])
-            asn.eval()
-
-            if hc_pt.exists():
-                hc = torch.load(str(hc_pt), map_location="cpu", weights_only=False)
-                asn_eval = HardContactConstrainedASN(
-                    asn, tau_sep=float(hc["t_sep"]), Z_c=float(hc["R_c"]),
-                    target_rho=hc["target_rho"], target_u=hc["target_u"],
-                    target_P=hc["target_P"],
-                    tau_t=float(hc["tau_t"]), tau_r=float(hc["tau_r"]),
-                )
+            asn_eval, _ = load_checkpoint(asn_pt, asn)
 
             t_sep = dataset.t_sep
             t_end = dataset.t_end
@@ -386,8 +376,7 @@ def main():
             det_pt = ckpt_dir / "detonation.pt"
             det_loaded = False
             if det_pt.exists():
-                det.load_state_dict(torch.load(str(det_pt), map_location="cpu", weights_only=False)["state_dict"])
-                det.eval()
+                det, _ = load_checkpoint(det_pt, det)
                 det_loaded = True
                 errors_A = compute_field_errors(dataset, det,
                                                 t_min=0, t_max=t_sep,
@@ -404,7 +393,7 @@ def main():
                                             n_samples=1500)
 
             # Print tables
-            for phase, errs in [("Phase A (detonation domain, DetNet raw)", errors_A),
+            for phase, errs in [("Phase A (detonation domain, constrained predictor)", errors_A),
                                 ("Phase B (air shock domain, ASN+HC)", errors_B)]:
                 print(f"\n    {phase} -- {errs.get('n_points', 0)} points")
                 if errs.get("rho", {}).get("mae") is not None:
@@ -434,27 +423,29 @@ def main():
                 gate_max = max(rho_err, u_err, P_err)
                 gate_status = "[PASS]" if gate_max < 0.05 else "[FAIL]"
                 print(f"      rho: {100*rho_err:.1f}%  u: {100*u_err:.1f}%  P: {100*P_err:.1f}%")
-                print(f"      Max error = {100*gate_max:.1f}%  {gate_status} (target < 5%)")
+                print(f"      Anchor consistency = {100*gate_max:.1f}%  {gate_status} (construction check, not convergence)")
 
-            # Coupling consistency (DetNet raw vs ASN at (t_sep, R_c))
+            # Pressure/velocity continuity and separate air-side RH density
             if det_loaded:
-                print(f"\n    Coupling consistency at (t_sep, R_c) [DetNet raw vs ASN+HC]:")
+                print(f"\n    Coupling at (t_sep, R_c): u/P continuity + air density vs RH:")
                 with torch.no_grad():
                     t_p = torch.tensor([[float(t_sep)]], dtype=torch.float32)
                     r_p = torch.tensor([[float(R_c)]], dtype=torch.float32)
                     rho_det, u_det, P_det = det(t_p, r_p)
                     rho_asn, u_asn, P_asn = asn_eval(t_p, r_p)
+                rho_air_ref = float(air_contact_density(P_det, gamma=air["gamma"],
+                                                       rho_a=air["rho_a"], P_a=air["P_a"]))
                 errors = {
-                    "rho": abs(float(rho_asn) - float(rho_det)) / max(float(rho_det), 1e-10),
+                    "rho": abs(float(rho_asn) - rho_air_ref) / max(rho_air_ref, 1e-10),
                     "u":   abs(float(u_asn) - float(u_det)) / max(abs(float(u_det)), 1.0),
                     "P":   abs(float(P_asn) - float(P_det)) / max(float(P_det), 1e-10),
                 }
-                print(f"      Deltarho/rho = {100*errors['rho']:.3f}%  "
+                print(f"      air-density RH error = {100*errors['rho']:.3f}%  "
                       f"Deltau/u = {100*errors['u']:.3f}%  "
                       f"DeltaP/P = {100*errors['P']:.3f}%")
                 max_err = max(errors.values())
                 cs_status = "[PASS]" if max_err < 0.01 else "[INFO]"
-                print(f"      Max error = {100*max_err:.3f}%  {cs_status} (target < 1%; note: raw DetNet vs ASN+HC, expect mismatch)")
+                print(f"      Max error = {100*max_err:.3f}%  {cs_status} (target < 1%; products/air density jump is allowed)")
             else:
                 print(f"      [SKIP] No detonation checkpoint")
 

@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from data.d3plot_dataset import D3plotLineDataset
-from pinn.networks import HardContactConstrainedASN, build_networks
+from pinn.networks import build_networks
+from pinn.checkpoints import load_checkpoint
 
 # ── Config ─────────────────────────────────────────────────────
 RADII = {
@@ -77,21 +78,11 @@ def load_model(r_mm):
     ckpt_dir = ROOT / cfg["training"]["checkpoint_dir"]
     det_pt = ckpt_dir / "detonation.pt"
     asn_pt = ckpt_dir / "air_shock.pt"
-    hc_pt = ckpt_dir / "air_shock_hc_meta.pt"
-
-    asn_eval = asn
     if det_pt.exists():
-        det.load_state_dict(torch.load(det_pt, map_location="cpu", weights_only=False)["state_dict"]); det.eval()
-    if asn_pt.exists():
-        asn.load_state_dict(torch.load(asn_pt, map_location="cpu", weights_only=False)["state_dict"]); asn.eval()
-
-    if hc_pt.exists():
-        hc = torch.load(hc_pt, map_location="cpu", weights_only=False)
-        asn_eval = HardContactConstrainedASN(
-            asn, tau_sep=float(hc["t_sep"]), Z_c=float(hc["R_c"]),
-            target_rho=hc["target_rho"], target_u=hc["target_u"], target_P=hc["target_P"],
-            tau_t=float(hc["tau_t"]), tau_r=float(hc["tau_r"]),
-        )
+        det, _ = load_checkpoint(det_pt, det)
+    if not asn_pt.exists():
+        raise FileNotFoundError(asn_pt)
+    asn_eval, _ = load_checkpoint(asn_pt, asn)
     return dataset, asn_eval, cfg, air
 
 

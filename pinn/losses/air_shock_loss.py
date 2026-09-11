@@ -112,8 +112,8 @@ class AirShockICLoss(nn.Module):
     shock is co-located there (R_s(t_sep) = R_c, no intermediate post-shock
     region).  The IC therefore has just two pieces:
 
-    * r = R_c (single point):  match the frozen DetonationNet output
-      (rho_x_pred, u_x_pred, P_x_pred).
+    * r = R_c (single point): inherit frozen A's u/P; air-side density
+      follows the initial ideal-gas shock RH relation, not product density.
     * r in (R_c, x_end]:        ambient (rho_a, 0, P_a).
 
     The contact-point sample is repeated ``contact_repeat`` times so the
@@ -132,6 +132,7 @@ class AirShockICLoss(nn.Module):
         contact_repeat: int = 16,
         u_ref: float = 1000.0,
         device: str = "cpu",
+        gamma: float = 1.4,
     ) -> None:
         super().__init__()
         self.net = net
@@ -151,7 +152,9 @@ class AirShockICLoss(nn.Module):
         with torch.no_grad():
             t_p = torch.tensor([[self.t_sep]], device=self.device, dtype=torch.float32)
             r_p = torch.tensor([[self.R_c]],  device=self.device, dtype=torch.float32)
-            rho_x, u_x, P_x = self.frozen(t_p, r_p)
+            _, u_x, P_x = self.frozen(t_p, r_p)
+            from pinn.coupling import air_contact_density
+            rho_x = air_contact_density(P_x, gamma=gamma, rho_a=self.rho_a, P_a=self.P_a)
             self.register_buffer("rho_x_pred", rho_x.detach().clone(), persistent=False)
             self.register_buffer("u_x_pred",   u_x.detach().clone(),   persistent=False)
             self.register_buffer("P_x_pred",   P_x.detach().clone(),   persistent=False)

@@ -59,6 +59,24 @@ data:
   # filling r<25 mm), tnt1(4), tnt11(7).  The three 'air' parts are 1, 5, 6.
   vf_tnt_slot:           [2, 3, 4, 7]       # TNT: tnt(2), 1n1(3), tnt1(4), tnt11(7)
   vf_threshold:          0.01          # vf_sum > threshold defines product side
+  batch_size: 2                       # bounded memory for large local d3plot files
+  burn_hv_slot: null                   # only set after verifying actual reaction-progress output
+  center: [0.0, 0.0, 0.0]             # SI metres; center of THIS simulation
+
+# Numerical event diagnostics. These do not change the PINN's hard anchors.
+# Times/positions and reasons are written to events.json/events_summary.txt.
+events:
+  persistence_frames: 3               # persistence of a resolved compressed-air layer
+  min_air_samples: 3                  # populated shells (filled empty shells excluded)
+  min_gap_cells: 2.0                  # compared with actual radial cell spans
+  vf_low: 0.1
+  vf_high: 0.9
+  cj_band_inner_fraction: 0.9         # inspect actual cells at 0.9 R_0 <= r <= R_0
+  cj_vf_min: 0.95                     # TNT-dominated cells only
+  cj_rel_tol: 0.15                    # each of P/rho/u must match; a diagnostic tolerance
+  burn_complete_min: 0.99             # used only when a verified burn_hv_slot is provided
+  # Optional SI reference overriding the project CJ solver FOR DETECTION only:
+  # cj_reference: {P: ..., rho: ..., u: ...}
 
 # ------------------ Ambient air ------------------
 air:

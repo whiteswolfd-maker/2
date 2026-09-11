@@ -17,8 +17,8 @@ AirShockNet / FourierFeatureAirShockNet
 
 The two networks are coupled in one direction at the single point
 (t_sep, R_c): once DetonationNet is trained and frozen, its prediction
-(rho_x_pred, u_x_pred, P_x_pred) at that point becomes the IC value for
-AirShockNet (handled in the loss module, not here).
+(u_x_pred, P_x_pred) at that point supplies the air-side matching state.
+Air density is computed separately from the initial air-shock RH relation.
 
 References
 ----------
@@ -315,20 +315,12 @@ class FourierFeatureAirShockNet(nn.Module):
 
 
 class HardDetNetConstraint(nn.Module):
-    """Hard-constrain DetonationNet at TWO fixed points.
+    """Smooth interpolation fixing CJ and the products-side outflow point.
 
-    Blends the raw network output with target values via exponential envelopes::
-
-        w_cj(tau,Z)   = exp(-|tau-0|/tau_t_cj  -  |Z-Z_R0|/tau_r_cj)
-        w_cont(tau,Z) = exp(-|tau-tau_sep|/tau_t  -  |Z-Z_c|/tau_r)
-        w = clamp(w_cj + w_cont, 0, 1)
-        output = raw * (1 - w) + (target_cj*w_cj + target_cont*w_cont) / w
-
-    At (0, Z_R0):      w_cj=1, w_cont≈0 → output = CJ state exactly.
-    At (tau_sep, Z_c): w_cj≈0, w_cont=1 → output = contact state exactly.
-    Elsewhere:          w ≈ 0 → output = raw network prediction.
-
-    All coordinates in scaled (tau, Z) units.
+    Gaussian envelopes are multiplied by cardinal weights, so the influence
+    of the OTHER anchor is exactly zero at each anchor, even for overlapping
+    envelopes. Nonnegative weights sum to <= 1, preserving rho/P positivity.
+    Coordinates and envelope widths use the same units as the base network.
     """
 
     def __init__(
@@ -349,6 +341,11 @@ class HardDetNetConstraint(nn.Module):
         self.tau_t = float(tau_t); self.tau_r = float(tau_r)
         self.tau_t_cj = float(tau_t_cj); self.tau_r_cj = float(tau_r_cj)
         self.use_contact = bool(use_contact)
+        if not all(math.isfinite(v) and v > 0 for v in (
+            self.tau_sep, self.Z_c, self.Z_R0, self.tau_t, self.tau_r,
+            self.tau_t_cj, self.tau_r_cj,
+        )):
+            raise ValueError("Anchor time, radii and envelope widths must be positive and finite.")
         self.register_buffer("rho_cj", torch.tensor(rho_cj))
         self.register_buffer("u_cj",   torch.tensor(u_cj))
         self.register_buffer("P_cj",   torch.tensor(P_cj))
@@ -359,21 +356,25 @@ class HardDetNetConstraint(nn.Module):
     def forward(self, tau: torch.Tensor, Z: torch.Tensor):
         rho_raw, u_raw, P_raw = self.net(tau, Z)
 
-        w_cj   = torch.exp(-torch.abs(tau)                / self.tau_t_cj
-                           - torch.abs(Z - self.Z_R0)     / self.tau_r_cj)
-        w_cont = torch.zeros_like(w_cj) if not self.use_contact else \
-                 torch.exp(-torch.abs(tau - self.tau_sep) / self.tau_t
-                           - torch.abs(Z   - self.Z_c)    / self.tau_r)
-        w = (w_cj + w_cont).clamp(max=1.0)
-        w_safe = w.clamp(min=1e-12)
-
-        target_rho = (self.rho_cj * w_cj + self.rho_x * w_cont) / w_safe
-        target_u   = (self.u_cj   * w_cj + self.u_x   * w_cont) / w_safe
-        target_P   = (self.P_cj   * w_cj + self.P_x   * w_cont) / w_safe
-
-        rho = rho_raw * (1.0 - w) + target_rho * w
-        u   = u_raw   * (1.0 - w) + target_u   * w
-        P   = P_raw   * (1.0 - w) + target_P   * w
+        d_cj = (tau / self.tau_t_cj).square() + ((Z - self.Z_R0) / self.tau_r_cj).square()
+        d_cont = ((tau - self.tau_sep) / self.tau_t).square() + \
+                 ((Z - self.Z_c) / self.tau_r).square()
+        w_cj = torch.exp(-d_cj)
+        w_cont = torch.zeros_like(w_cj)
+        if self.use_contact:
+            denom = (d_cj + d_cont).clamp_min(torch.finfo(tau.dtype).tiny)
+            w_cj = w_cj * d_cont / denom
+            w_cont = torch.exp(-d_cont) * d_cj / denom
+        w_raw = (1.0 - w_cj - w_cont).clamp_min(0.0)
+        rho = rho_raw * w_raw + self.rho_cj * w_cj + self.rho_x * w_cont
+        P = P_raw * w_raw + self.P_cj * w_cj + self.P_x * w_cont
+        # Preserve the base network's u(t,0)=0 without shifting either anchor.
+        eps = float(getattr(self.net, "eps_origin", 1e-4))
+        radial = torch.tanh(Z / eps)
+        u = u_raw * w_raw + radial * (
+            self.u_cj * w_cj / math.tanh(self.Z_R0 / eps)
+            + self.u_x * w_cont / math.tanh(self.Z_c / eps)
+        )
         return rho, u, P
 
 
@@ -400,6 +401,7 @@ class HardContactConstrainedASN(nn.Module):
         target_P:   torch.Tensor,
         tau_t: float = 1.0e-6,
         tau_r: float = 1.0e-3,
+        density_source: str = "explicit",
     ) -> None:
         super().__init__()
         self.net = net
@@ -407,6 +409,7 @@ class HardContactConstrainedASN(nn.Module):
         self.Z_c = float(Z_c)
         self.tau_t = float(tau_t)
         self.tau_r = float(tau_r)
+        self.density_source = density_source
         self.register_buffer("target_rho", target_rho.detach().clone())
         self.register_buffer("target_u",   target_u.detach().clone())
         self.register_buffer("target_P",   target_P.detach().clone())
